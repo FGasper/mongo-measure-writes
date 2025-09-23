@@ -52,10 +52,8 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 					bson.D{
 						{"$gte", bson.A{
 							"$ts",
-							bson.D{
-								{"$toTimestamp", bson.D{
-									{"$subtract", bson.A{"$$NOW", fiveMinutesMs}},
-								}},
+							bson.Timestamp{
+								T: uint32(time.Now().Add(-5 * time.Minute).Unix()),
 							},
 						}},
 					},
@@ -111,7 +109,6 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 
 	for {
 		func() {
-			time.Sleep(statsInterval)
 
 			cursor, err := coll.Aggregate(ctx, pipeline)
 			if err != nil {
@@ -131,6 +128,8 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 				log.Fatal(err)
 			}
 		}()
+
+		time.Sleep(statsInterval)
 	}
 }
 
