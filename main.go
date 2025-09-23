@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"maps"
 	"math"
 	"os"
@@ -21,7 +22,9 @@ import (
 const statsInterval = 15 * time.Second
 
 func main() {
-	if err := _run(); err != nil {
+	ctx := context.Background()
+
+	if err := _run(ctx); err != nil {
 		fmt.Fprint(os.Stderr, err.Error()+"\n")
 		os.Exit(1)
 	}
@@ -34,11 +37,106 @@ var eventsToTruncate = []string{
 	"delete",
 }
 
-func _run() error {
-	ctx := context.Background()
+func _runOplogMode(ctx context.Context, client *mongo.Client) error {
+	coll := client.Database("local").Collection("oplog.rs")
 
-	if len(os.Args) != 2 {
-		return fmt.Errorf("give connection string (and only that)")
+	// 5 minutes in milliseconds
+	fiveMinutesMs := int64(5 * 60 * 1000)
+
+	// Build aggregation pipeline
+	pipeline := mongo.Pipeline{
+		// Stage 1: Filter relevant entries in last 5 min
+		{{"$match", bson.D{
+			{"$expr", bson.D{
+				{"$and", bson.A{
+					bson.D{
+						{"$gte", bson.A{
+							"$ts",
+							bson.D{
+								{"$toTimestamp", bson.D{
+									{"$subtract", bson.A{"$$NOW", fiveMinutesMs}},
+								}},
+							},
+						}},
+					},
+					bson.D{
+						{"$or", bson.A{
+							bson.D{{"$in", bson.A{"$op", bson.A{"i", "u", "d"}}}},
+							bson.D{
+								{"$and", bson.A{
+									bson.D{{"$eq", bson.A{"$op", "c"}}},
+									bson.D{{"$eq", bson.A{"$ns", "admin.$cmd"}}},
+									bson.D{{"$isArray", "$o.applyOps"}},
+								}},
+							},
+						}},
+					},
+				}},
+			}},
+		}}},
+		// Stage 2: Normalize to "ops" array
+		{{"$addFields", bson.D{
+			{"ops", bson.D{
+				{"$cond", bson.D{
+					{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
+					{"then", "$o.applyOps"},
+					{"else", bson.A{"$$ROOT"}},
+				}},
+			}},
+		}}},
+		// Stage 3: Unwind ops
+		{{"$unwind", "$ops"}},
+		// Stage 4: Filter to relevant sub-ops
+		{{"$match", bson.D{
+			{"ops.op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
+		}}},
+		// Stage 5: Compute size of each op
+		{{"$addFields", bson.D{
+			{"size", bson.D{{"$bsonSize", "$ops"}}},
+		}}},
+		// Stage 6: Group by op type
+		{{"$group", bson.D{
+			{"_id", "$ops.op"},
+			{"count", bson.D{{"$sum", 1}}},
+			{"totalSize", bson.D{{"$sum", "$size"}}},
+		}}},
+		// Stage 7: Project clean output
+		{{"$project", bson.D{
+			{"op", "$_id"},
+			{"count", 1},
+			{"totalSize", 1},
+			{"_id", 0},
+		}}},
+	}
+
+	for {
+		func() {
+			time.Sleep(statsInterval)
+
+			cursor, err := coll.Aggregate(ctx, pipeline)
+			if err != nil {
+				log.Fatalf("Aggregation failed: %v", err)
+			}
+			defer cursor.Close(ctx)
+
+			// Print results
+			for cursor.Next(ctx) {
+				var doc bson.M
+				if err := cursor.Decode(&doc); err != nil {
+					log.Fatal(err)
+				}
+				fmt.Printf("%+v\n", doc)
+			}
+			if err := cursor.Err(); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
+}
+
+func _run(ctx context.Context) error {
+	if len(os.Args) < 2 {
+		return fmt.Errorf("give connection string first")
 	}
 
 	client, err := mongo.Connect(
@@ -46,6 +144,10 @@ func _run() error {
 	)
 	if err != nil {
 		return fmt.Errorf("connecting: %w", err)
+	}
+
+	if slices.Contains(os.Args, "--oplog") {
+		return _runOplogMode(ctx, client)
 	}
 
 	fullEventName := map[string]string{}
