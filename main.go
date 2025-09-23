@@ -40,9 +40,6 @@ var eventsToTruncate = []string{
 func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 	coll := client.Database("local").Collection("oplog.rs")
 
-	// 5 minutes in milliseconds
-	fiveMinutesMs := int64(5 * 60 * 1000)
-
 	// Build aggregation pipeline
 	pipeline := mongo.Pipeline{
 		// Stage 1: Filter relevant entries in last 5 min
@@ -53,7 +50,7 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 						{"$gte", bson.A{
 							"$ts",
 							bson.Timestamp{
-								T: uint32(time.Now().Add(-5 * time.Minute).Unix()),
+								T: uint32(time.Now().Add(-10 * time.Second).Unix()),
 							},
 						}},
 					},
@@ -110,6 +107,7 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 	for {
 		func() {
 
+			fmt.Printf("starting agg\n")
 			cursor, err := coll.Aggregate(ctx, pipeline)
 			if err != nil {
 				log.Fatalf("Aggregation failed: %v", err)
@@ -117,6 +115,7 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 			defer cursor.Close(ctx)
 
 			// Print results
+			fmt.Printf("reading agg\n")
 			for cursor.Next(ctx) {
 				var doc bson.M
 				if err := cursor.Decode(&doc); err != nil {
