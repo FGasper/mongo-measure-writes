@@ -40,6 +40,9 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 	coll := client.Database("local").Collection("oplog.rs")
 
 	createPipeline := func() mongo.Pipeline {
+
+		// NB: This query seems to run much faster when querying on a full
+		// timestamp rather than just ts.t.
 		secondsAgo := uint32(time.Now().Add(-statsInterval).Unix())
 		timestamp := bson.Timestamp{T: secondsAgo}
 
