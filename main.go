@@ -37,6 +37,8 @@ var eventsToTruncate = []string{
 }
 
 func _runOplogMode(ctx context.Context, client *mongo.Client) error {
+	fmt.Printf("Querying the oplog for write stats every %s …\n", statsInterval)
+
 	coll := client.Database("local").Collection("oplog.rs")
 
 	createPipeline := func() mongo.Pipeline {
