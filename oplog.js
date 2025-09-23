@@ -1,4 +1,4 @@
-db.getSiblingDB("local").getCollection("oplog.rs").aggregate([
+console.log(db.getSiblingDB("local").getCollection("oplog.rs").aggregate([
   {
     $match: { ts: {$gte: Timestamp( Math.floor((new Date().getTime() / 1000) - 5), 0)}},
   },
@@ -49,4 +49,4 @@ db.getSiblingDB("local").getCollection("oplog.rs").aggregate([
       _id: 0
     }
   }
-])
+]).toArray())

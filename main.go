@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"maps"
 	"math"
 	"os"
@@ -40,93 +39,123 @@ var eventsToTruncate = []string{
 func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 	coll := client.Database("local").Collection("oplog.rs")
 
-	// Build aggregation pipeline
-	pipeline := mongo.Pipeline{
-		// Stage 1: Filter relevant entries in last 5 min
-		{{"$match", bson.D{
-			{"$expr", bson.D{
-				{"$and", bson.A{
+	createPipeline := func() mongo.Pipeline {
+		secondsAgo := uint32(time.Now().Add(-statsInterval).Unix())
+		timestamp := bson.Timestamp{T: secondsAgo}
+
+		return mongo.Pipeline{
+			// Stage 1: Match timestamp >= now - 5 sec
+			{{"$match", bson.D{
+				{"ts", bson.D{{"$gte", timestamp}}},
+			}}},
+			// Stage 2: Match op in ["i", "u", "d"] or applyOps array
+			{{"$match", bson.D{
+				{"$or", bson.A{
 					bson.D{
-						{"$gte", bson.A{
-							"$ts",
-							bson.Timestamp{
-								T: uint32(time.Now().Add(-10 * time.Second).Unix()),
-							},
-						}},
+						{"op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
 					},
 					bson.D{
-						{"$or", bson.A{
-							bson.D{{"$in", bson.A{"$op", bson.A{"i", "u", "d"}}}},
-							bson.D{
-								{"$and", bson.A{
-									bson.D{{"$eq", bson.A{"$op", "c"}}},
-									bson.D{{"$eq", bson.A{"$ns", "admin.$cmd"}}},
-									bson.D{{"$isArray", "$o.applyOps"}},
-								}},
-							},
-						}},
+						{"op", "c"},
+						{"ns", "admin.$cmd"},
+						{"o.applyOps", bson.D{{"$type", "array"}}},
 					},
 				}},
-			}},
-		}}},
-		// Stage 2: Normalize to "ops" array
-		{{"$addFields", bson.D{
-			{"ops", bson.D{
-				{"$cond", bson.D{
-					{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
-					{"then", "$o.applyOps"},
-					{"else", bson.A{"$$ROOT"}},
+			}}},
+			// Stage 3: Normalize to ops array
+			{{"$addFields", bson.D{
+				{"ops", bson.D{
+					{"$cond", bson.D{
+						{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
+						{"then", "$o.applyOps"},
+						{"else", bson.A{"$$ROOT"}},
+					}},
 				}},
-			}},
-		}}},
-		// Stage 3: Unwind ops
-		{{"$unwind", "$ops"}},
-		// Stage 4: Filter to relevant sub-ops
-		{{"$match", bson.D{
-			{"ops.op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
-		}}},
-		// Stage 5: Compute size of each op
-		{{"$addFields", bson.D{
-			{"size", bson.D{{"$bsonSize", "$ops"}}},
-		}}},
-		// Stage 6: Group by op type
-		{{"$group", bson.D{
-			{"_id", "$ops.op"},
-			{"count", bson.D{{"$sum", 1}}},
-			{"totalSize", bson.D{{"$sum", "$size"}}},
-		}}},
-		// Stage 7: Project clean output
-		{{"$project", bson.D{
-			{"op", "$_id"},
-			{"count", 1},
-			{"totalSize", 1},
-			{"_id", 0},
-		}}},
+			}}},
+			// Stage 4: Unwind ops
+			{{"$unwind", "$ops"}},
+			// Stage 5: Match sub-ops of interest
+			{{"$match", bson.D{
+				{"ops.op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
+			}}},
+			// Stage 6: Add BSON size per op
+			{{"$addFields", bson.D{
+				{"size", bson.D{{"$bsonSize", "$ops"}}},
+			}}},
+			// Stage 7: Group by op type
+			{{"$group", bson.D{
+				{"_id", "$ops.op"},
+				{"count", bson.D{{"$sum", 1}}},
+				{"totalSize", bson.D{{"$sum", "$size"}}},
+				{"minTs", bson.D{{"$min", "$ts"}}},
+				{"maxTs", bson.D{{"$max", "$ts"}}},
+			}}},
+			// Stage 8: Final projection
+			{{"$project", bson.D{
+				{"op", "$_id"},
+				{"count", 1},
+				{"totalSize", 1},
+				{"minTs", 1},
+				{"maxTs", 1},
+				{"_id", 0},
+			}}},
+		}
 	}
 
 	for {
-		func() {
+		cursor, err := coll.Aggregate(ctx, createPipeline())
+		if err != nil {
+			return fmt.Errorf("querying oplog: %w", err)
+		}
 
-			fmt.Printf("starting agg\n")
-			cursor, err := coll.Aggregate(ctx, pipeline)
-			if err != nil {
-				log.Fatalf("Aggregation failed: %v", err)
-			}
-			defer cursor.Close(ctx)
+		var minTS, maxTS bson.Timestamp
+		eventSizesByType := map[string]int{}
+		eventCountsByType := map[string]int{}
 
-			// Print results
-			fmt.Printf("reading agg\n")
-			for cursor.Next(ctx) {
-				var doc bson.M
-				if err := cursor.Decode(&doc); err != nil {
-					log.Fatal(err)
-				}
-				fmt.Printf("%+v\n", doc)
+		for cursor.Next(ctx) {
+			decoded := struct {
+				Op        string
+				Count     int
+				TotalSize int
+				MinTS     bson.Timestamp
+				MaxTS     bson.Timestamp
+			}{}
+
+			if err := cursor.Decode(&decoded); err != nil {
+				_ = cursor.Close(ctx)
+				return fmt.Errorf("decoding oplog aggregation: %w", err)
 			}
-			if err := cursor.Err(); err != nil {
-				log.Fatal(err)
+
+			eventSizesByType[decoded.Op] = decoded.TotalSize
+			eventCountsByType[decoded.Op] = decoded.Count
+
+			if minTS.IsZero() {
+				minTS = decoded.MinTS
+			} else {
+				minTS = lo.MinBy(
+					sliceOf(minTS, decoded.MinTS),
+					bson.Timestamp.Before,
+				)
 			}
-		}()
+
+			maxTS = lo.MaxBy(
+				sliceOf(maxTS, decoded.MaxTS),
+				bson.Timestamp.After,
+			)
+		}
+		if err := cursor.Err(); err != nil {
+			_ = cursor.Close(ctx)
+			return fmt.Errorf("reading oplog aggregation: %w", err)
+		}
+
+		delta := time.Duration(maxTS.T-minTS.T) * time.Second
+
+		displayTable(
+			eventCountsByType,
+			eventSizesByType,
+			delta,
+		)
+
+		_ = cursor.Close(ctx)
 
 		time.Sleep(statsInterval)
 	}
@@ -146,11 +175,6 @@ func _run(ctx context.Context) error {
 
 	if slices.Contains(os.Args, "--oplog") {
 		return _runOplogMode(ctx, client)
-	}
-
-	fullEventName := map[string]string{}
-	for _, eventName := range eventsToTruncate {
-		fullEventName[eventName[:1]] = eventName
 	}
 
 	sess, err := client.StartSession()
@@ -197,7 +221,7 @@ func _run(ctx context.Context) error {
 
 	fmt.Printf("Listening for change events. Stats showing every %s …\n", statsInterval)
 
-	eventSizesByType := map[string]int64{}
+	eventSizesByType := map[string]int{}
 	eventCountsByType := map[string]int{}
 	eventCountsMutex := sync.Mutex{}
 	var changeStreamLag uint32
@@ -213,50 +237,8 @@ func _run(ctx context.Context) error {
 			now := time.Now()
 			delta := now.Sub(startTime)
 
-			allEventsCount := lo.Sum(slices.Collect(maps.Values(eventCountsByType)))
-			totalSize := lo.Sum(slices.Collect(maps.Values(eventSizesByType)))
-
-			if allEventsCount > 0 {
-				fmt.Printf(
-					"\n%s ops/sec (%s/sec; avg: %s)\n",
-					FmtReal(math.Round((mmmath.DivideToF64(allEventsCount, delta.Seconds())))),
-					FmtBytes(mmmath.DivideToF64(totalSize, delta.Seconds())),
-					FmtBytes(mmmath.DivideToF64(totalSize, allEventsCount)),
-				)
-
-				table := tablewriter.NewWriter(os.Stdout)
-				table.Header([]string{
-					"Event Type",
-					"Count",
-					"Size",
-					"% of total count",
-					"% of total size",
-				})
-
-				eventTypes := slices.Sorted(maps.Keys(eventCountsByType))
-
-				for _, eventType := range eventTypes {
-					countFraction := mmmath.DivideToF64(eventCountsByType[eventType], allEventsCount)
-					sizeFraction := mmmath.DivideToF64(eventSizesByType[eventType], totalSize)
-
-					var fullEventType string
-
-					if full, shortened := fullEventName[eventType]; shortened {
-						fullEventType = full
-					} else {
-						fullEventType = eventType
-					}
-
-					table.Append([]string{
-						fullEventType,
-						FmtReal(eventCountsByType[eventType]),
-						FmtBytes(eventSizesByType[eventType]),
-						FmtReal(math.Round(100*countFraction)) + "%",
-						FmtReal(math.Round(100*sizeFraction)) + "%",
-					})
-				}
-
-				table.Render()
+			if len(eventCountsByType) > 0 {
+				displayTable(eventCountsByType, eventSizesByType, delta)
 
 				fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
 
@@ -272,12 +254,21 @@ func _run(ctx context.Context) error {
 		}
 	}()
 
+	fullEventName := map[string]string{}
+	for _, eventName := range eventsToTruncate {
+		fullEventName[eventName[:1]] = eventName
+	}
+
 	for cs.Next(sctx) {
 		op := cs.Current.Lookup("op").StringValue()
 
+		if fullOp, isShortened := fullEventName[op]; isShortened {
+			op = fullOp
+		}
+
 		eventCountsMutex.Lock()
 		eventCountsByType[op]++
-		eventSizesByType[op] += cs.Current.Lookup("size").AsInt64()
+		eventSizesByType[op] += int(cs.Current.Lookup("size").AsInt64())
 
 		sessTS, err := GetClusterTimeFromSession(sess)
 		if err != nil {
@@ -297,8 +288,54 @@ func _run(ctx context.Context) error {
 	return fmt.Errorf("unexpected end of change stream")
 }
 
+func displayTable(
+	eventCountsByType map[string]int,
+	eventSizesByType map[string]int,
+	delta time.Duration,
+) {
+	allEventsCount := lo.Sum(slices.Collect(maps.Values(eventCountsByType)))
+	totalSize := lo.Sum(slices.Collect(maps.Values(eventSizesByType)))
+
+	fmt.Printf(
+		"\n%s ops/sec (%s/sec; avg: %s)\n",
+		FmtReal(math.Round((mmmath.DivideToF64(allEventsCount, delta.Seconds())))),
+		FmtBytes(mmmath.DivideToF64(totalSize, delta.Seconds())),
+		FmtBytes(mmmath.DivideToF64(totalSize, allEventsCount)),
+	)
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.Header([]string{
+		"Event Type",
+		"Count",
+		"Size",
+		"% of total count",
+		"% of total size",
+	})
+
+	eventTypes := slices.Sorted(maps.Keys(eventCountsByType))
+
+	for _, eventType := range eventTypes {
+		countFraction := mmmath.DivideToF64(eventCountsByType[eventType], allEventsCount)
+		sizeFraction := mmmath.DivideToF64(eventSizesByType[eventType], totalSize)
+
+		table.Append([]string{
+			eventType,
+			FmtReal(eventCountsByType[eventType]),
+			FmtBytes(eventSizesByType[eventType]),
+			FmtReal(math.Round(100*countFraction)) + "%",
+			FmtReal(math.Round(100*sizeFraction)) + "%",
+		})
+	}
+
+	table.Render()
+}
+
 func evacuateMap[K comparable, V any, M ~map[K]V](theMap M) {
 	for k := range theMap {
 		delete(theMap, k)
 	}
+}
+
+func sliceOf[T any](els ...T) []T {
+	return slices.Clone(els)
 }
