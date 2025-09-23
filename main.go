@@ -53,8 +53,15 @@ func _run() error {
 		fullEventName[eventName[:1]] = eventName
 	}
 
+	sess, err := client.StartSession()
+	if err != nil {
+		return fmt.Errorf("opening session: %w", err)
+	}
+
+	sctx := mongo.NewSessionContext(ctx, sess)
+
 	cs, err := client.Watch(
-		ctx,
+		sctx,
 		mongo.Pipeline{
 			{{"$addFields", bson.D{
 				{"operationType", "$$REMOVE"},
@@ -74,6 +81,7 @@ func _run() error {
 				{"_id", 1},
 				{"op", 1},
 				{"size", 1},
+				{"clusterTime", 1},
 			}}},
 		},
 		options.ChangeStream().
@@ -85,13 +93,14 @@ func _run() error {
 	if err != nil {
 		return fmt.Errorf("opening change stream: %w", err)
 	}
-	defer cs.Close(ctx)
+	defer cs.Close(sctx)
 
 	fmt.Printf("Listening for change events. Stats showing every %s …\n", statsInterval)
 
 	eventSizesByType := map[string]int64{}
 	eventCountsByType := map[string]int{}
 	eventCountsMutex := sync.Mutex{}
+	var changeStreamLag uint32
 
 	go func() {
 		startTime := time.Now()
@@ -130,17 +139,6 @@ func _run() error {
 					countFraction := mmmath.DivideToF64(eventCountsByType[eventType], allEventsCount)
 					sizeFraction := mmmath.DivideToF64(eventSizesByType[eventType], totalSize)
 
-					/*
-						fmt.Printf(
-							"\t%s: %d, %d%% of events, %d%% of size (avg: %s)\n",
-							eventType,
-							eventCountsByType[eventType],
-							int(math.Round(100*countFraction)),
-							int(math.Round(100*sizeFraction)),
-							FmtBytes(mmmath.DivideToF64(eventSizesByType[eventType], eventCountsByType[eventType])),
-						)
-					*/
-
 					var fullEventType string
 
 					if full, shortened := fullEventName[eventType]; shortened {
@@ -160,6 +158,8 @@ func _run() error {
 
 				table.Render()
 
+				fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
+
 				evacuateMap(eventCountsByType)
 				evacuateMap(eventSizesByType)
 			} else {
@@ -172,12 +172,22 @@ func _run() error {
 		}
 	}()
 
-	for cs.Next(ctx) {
+	for cs.Next(sctx) {
 		op := cs.Current.Lookup("op").StringValue()
 
 		eventCountsMutex.Lock()
 		eventCountsByType[op]++
 		eventSizesByType[op] += cs.Current.Lookup("size").AsInt64()
+
+		sessTS, err := GetClusterTimeFromSession(sess)
+		if err != nil {
+
+		} else {
+			eventT, _ := cs.Current.Lookup("clusterTime").Timestamp()
+
+			changeStreamLag = sessTS.T - eventT
+		}
+
 		eventCountsMutex.Unlock()
 	}
 	if cs.Err() != nil {
