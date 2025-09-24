@@ -3,8 +3,9 @@
 This tool reports various statistics around a MongoDB cluster’s write load.
 
 ## Build Instructions
-
-Just run `go build`. 🙂
+```
+go build
+```
 
 ## Oplog Mode
 
