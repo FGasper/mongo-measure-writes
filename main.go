@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"math"
 	"os"
 	"slices"
 	"sync"
@@ -71,7 +70,26 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 				{"ops", bson.D{
 					{"$cond", bson.D{
 						{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
-						{"then", "$o.applyOps"},
+						//{"then", "$o.applyOps"},
+						{"then", bson.D{
+							{"$map", bson.D{
+								{"input", "$o.applyOps"},
+								{"as", "opEntry"},
+								{"in", bson.D{
+									{"$mergeObjects", bson.A{
+										"$$opEntry",
+										bson.D{
+											{"op", bson.D{
+												{"$concat", bson.A{
+													"applyOps.",
+													"$$opEntry.op",
+												}},
+											}},
+										},
+									}},
+								}},
+							}},
+						}},
 						{"else", bson.A{"$$ROOT"}},
 					}},
 				}},
@@ -80,7 +98,10 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 			{{"$unwind", "$ops"}},
 			// Stage 5: Match sub-ops of interest
 			{{"$match", bson.D{
-				{"ops.op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
+				{"ops.op", bson.D{{"$in", bson.A{
+					"i", "u", "d",
+					"applyOps.i", "applyOps.u", "applyOps.d",
+				}}}},
 			}}},
 			// Stage 6: Add BSON size per op
 			{{"$addFields", bson.D{
@@ -242,16 +263,12 @@ func _run(ctx context.Context) error {
 			now := time.Now()
 			delta := now.Sub(startTime)
 
-			if len(eventCountsByType) > 0 {
-				displayTable(eventCountsByType, eventSizesByType, delta)
+			displayTable(eventCountsByType, eventSizesByType, delta)
 
-				fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
+			fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
 
-				evacuateMap(eventCountsByType)
-				evacuateMap(eventSizesByType)
-			} else {
-				fmt.Printf("\t(No recent events seen …)\n")
-			}
+			evacuateMap(eventCountsByType)
+			evacuateMap(eventSizesByType)
 
 			startTime = time.Now()
 
@@ -298,13 +315,18 @@ func displayTable(
 	eventSizesByType map[string]int,
 	delta time.Duration,
 ) {
+	if len(eventCountsByType) == 0 {
+		fmt.Printf("\t(No recent events seen …)\n")
+		return
+	}
+
 	allEventsCount := lo.Sum(slices.Collect(maps.Values(eventCountsByType)))
 	totalSize := lo.Sum(slices.Collect(maps.Values(eventSizesByType)))
 
 	fmt.Printf(
 		"\n%s ops/sec (%s/sec; avg: %s)\n",
-		FmtReal(math.Round((mmmath.DivideToF64(allEventsCount, delta.Seconds())))),
-		FmtBytes(mmmath.DivideToF64(totalSize, delta.Seconds())),
+		FmtReal((mmmath.DivideToF64(allEventsCount, 1+delta.Seconds()))),
+		FmtBytes(mmmath.DivideToF64(totalSize, 1+delta.Seconds())),
 		FmtBytes(mmmath.DivideToF64(totalSize, allEventsCount)),
 	)
 
@@ -327,8 +349,8 @@ func displayTable(
 			eventType,
 			FmtReal(eventCountsByType[eventType]),
 			FmtBytes(eventSizesByType[eventType]),
-			FmtReal(math.Round(100*countFraction)) + "%",
-			FmtReal(math.Round(100*sizeFraction)) + "%",
+			FmtReal(100*countFraction) + "%",
+			FmtReal(100*sizeFraction) + "%",
 		})
 	}
 
