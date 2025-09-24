@@ -6,6 +6,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/olekukonko/tablewriter v1.1.0
 	github.com/samber/lo v1.51.0
+	github.com/urfave/cli/v3 v3.4.1
 	go.mongodb.org/mongo-driver/v2 v2.3.0
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621
 )

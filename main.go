@@ -12,31 +12,90 @@ import (
 	mmmath "github.com/FGasper/mongo-measure-change-stream/math"
 	"github.com/olekukonko/tablewriter"
 	"github.com/samber/lo"
+	"github.com/urfave/cli/v3"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-const statsInterval = 15 * time.Second
-
 func main() {
-	ctx := context.Background()
+	getURI := func(c *cli.Command) (string, error) {
+		uri := c.Args().First()
+		if uri == "" {
+			return "", fmt.Errorf("give a connection string")
+		}
 
-	if err := _run(ctx); err != nil {
+		return uri, nil
+	}
+
+	durationFlag := cli.DurationFlag{
+		Name:    "duration",
+		Aliases: sliceOf("d"),
+		Usage:   "interval over which to compile metrics",
+		Value:   time.Minute,
+	}
+
+	cmd := cli.Command{
+		Name:  os.Args[0],
+		Usage: "Measure MongoDB document writes per second",
+		Commands: []*cli.Command{
+			{
+				Name:    "oplog",
+				Aliases: sliceOf("o"),
+				Usage:   "measure via oplog",
+				Flags: []cli.Flag{
+					&durationFlag,
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					uri, err := getURI(c)
+					if err != nil {
+						return err
+					}
+
+					return _runOplogMode(ctx, uri, c.Duration(durationFlag.Name))
+				},
+			},
+			{
+				Name:    "changestream",
+				Aliases: sliceOf("cs"),
+				Usage:   "measure via change stream",
+				Flags: []cli.Flag{
+					&durationFlag,
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					uri, err := getURI(c)
+					if err != nil {
+						return err
+					}
+
+					return _runChangeStream(ctx, uri, c.Duration(durationFlag.Name))
+				},
+			},
+		},
+	}
+
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprint(os.Stderr, err.Error()+"\n")
 		os.Exit(1)
 	}
 }
 
-var eventsToTruncate = []string{
+var eventsToTruncate = sliceOf(
 	"insert",
 	"update",
 	"replace",
 	"delete",
-}
+)
 
-func _runOplogMode(ctx context.Context, client *mongo.Client) error {
-	fmt.Printf("Querying the oplog for write stats every %s …\n", statsInterval)
+var oplogOps = sliceOf("i", "u", "d")
+
+func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
+	client, err := getClient(connstr)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Querying the oplog for write stats over the last %s …\n", interval)
 
 	coll := client.Database("local").Collection("oplog.rs")
 
@@ -44,7 +103,7 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 
 		// NB: This query seems to run much faster when querying on a full
 		// timestamp rather than just ts.t.
-		secondsAgo := uint32(time.Now().Add(-statsInterval).Unix())
+		secondsAgo := uint32(time.Now().Add(-interval).Unix())
 		timestamp := bson.Timestamp{T: secondsAgo}
 
 		return mongo.Pipeline{
@@ -56,7 +115,7 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 			{{"$match", bson.D{
 				{"$or", bson.A{
 					bson.D{
-						{"op", bson.D{{"$in", bson.A{"i", "u", "d"}}}},
+						{"op", bson.D{{"$in", oplogOps}}},
 					},
 					bson.D{
 						{"op", "c"},
@@ -98,10 +157,16 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 			{{"$unwind", "$ops"}},
 			// Stage 5: Match sub-ops of interest
 			{{"$match", bson.D{
-				{"ops.op", bson.D{{"$in", bson.A{
-					"i", "u", "d",
-					"applyOps.i", "applyOps.u", "applyOps.d",
-				}}}},
+				{"ops.op", bson.D{{"$in", lo.Flatten(
+					sliceOf(
+						oplogOps,
+						lo.Map(
+							oplogOps,
+							func(op string, _ int) string { return "applyOps." + op },
+						),
+					),
+				),
+				}}},
 			}}},
 			// Stage 6: Add BSON size per op
 			{{"$addFields", bson.D{
@@ -127,80 +192,77 @@ func _runOplogMode(ctx context.Context, client *mongo.Client) error {
 		}
 	}
 
-	for {
-		cursor, err := coll.Aggregate(ctx, createPipeline())
-		if err != nil {
-			return fmt.Errorf("querying oplog: %w", err)
+	cursor, err := coll.Aggregate(ctx, createPipeline())
+	if err != nil {
+		return fmt.Errorf("querying oplog: %w", err)
+	}
+
+	defer cursor.Close(ctx)
+
+	var minTS, maxTS bson.Timestamp
+	eventSizesByType := map[string]int{}
+	eventCountsByType := map[string]int{}
+
+	for cursor.Next(ctx) {
+		decoded := struct {
+			Op        string
+			Count     int
+			TotalSize int
+			MinTS     bson.Timestamp
+			MaxTS     bson.Timestamp
+		}{}
+
+		if err := cursor.Decode(&decoded); err != nil {
+			return fmt.Errorf("decoding oplog aggregation: %w", err)
 		}
 
-		var minTS, maxTS bson.Timestamp
-		eventSizesByType := map[string]int{}
-		eventCountsByType := map[string]int{}
+		eventSizesByType[decoded.Op] = decoded.TotalSize
+		eventCountsByType[decoded.Op] = decoded.Count
 
-		for cursor.Next(ctx) {
-			decoded := struct {
-				Op        string
-				Count     int
-				TotalSize int
-				MinTS     bson.Timestamp
-				MaxTS     bson.Timestamp
-			}{}
-
-			if err := cursor.Decode(&decoded); err != nil {
-				_ = cursor.Close(ctx)
-				return fmt.Errorf("decoding oplog aggregation: %w", err)
-			}
-
-			eventSizesByType[decoded.Op] = decoded.TotalSize
-			eventCountsByType[decoded.Op] = decoded.Count
-
-			if minTS.IsZero() {
-				minTS = decoded.MinTS
-			} else {
-				minTS = lo.MinBy(
-					sliceOf(minTS, decoded.MinTS),
-					bson.Timestamp.Before,
-				)
-			}
-
-			maxTS = lo.MaxBy(
-				sliceOf(maxTS, decoded.MaxTS),
-				bson.Timestamp.After,
+		if minTS.IsZero() {
+			minTS = decoded.MinTS
+		} else {
+			minTS = lo.MinBy(
+				sliceOf(minTS, decoded.MinTS),
+				bson.Timestamp.Before,
 			)
 		}
-		if err := cursor.Err(); err != nil {
-			_ = cursor.Close(ctx)
-			return fmt.Errorf("reading oplog aggregation: %w", err)
-		}
 
-		delta := time.Duration(maxTS.T-minTS.T) * time.Second
-
-		displayTable(
-			eventCountsByType,
-			eventSizesByType,
-			delta,
+		maxTS = lo.MaxBy(
+			sliceOf(maxTS, decoded.MaxTS),
+			bson.Timestamp.After,
 		)
-
-		_ = cursor.Close(ctx)
-
-		time.Sleep(statsInterval)
 	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("reading oplog aggregation: %w", err)
+	}
+
+	delta := time.Duration(maxTS.T-minTS.T) * time.Second
+
+	displayTable(
+		eventCountsByType,
+		eventSizesByType,
+		delta,
+	)
+
+	return nil
 }
 
-func _run(ctx context.Context) error {
-	if len(os.Args) < 2 {
-		return fmt.Errorf("give connection string first")
-	}
-
+func getClient(connstr string) (*mongo.Client, error) {
 	client, err := mongo.Connect(
-		options.Client().ApplyURI(os.Args[1]),
+		options.Client().ApplyURI(connstr),
 	)
 	if err != nil {
-		return fmt.Errorf("connecting: %w", err)
+		return nil, fmt.Errorf("connecting to %#q: %w", connstr, err)
 	}
 
-	if slices.Contains(os.Args, "--oplog") {
-		return _runOplogMode(ctx, client)
+	return client, nil
+}
+
+func _runChangeStream(ctx context.Context, connstr string, interval time.Duration) error {
+	client, err := getClient(connstr)
+	if err != nil {
+		return err
 	}
 
 	sess, err := client.StartSession()
@@ -245,7 +307,7 @@ func _run(ctx context.Context) error {
 	}
 	defer cs.Close(sctx)
 
-	fmt.Printf("Listening for change events. Stats showing every %s …\n", statsInterval)
+	fmt.Printf("Listening for change events. Stats showing every %s …\n", interval)
 
 	eventSizesByType := map[string]int{}
 	eventCountsByType := map[string]int{}
@@ -256,7 +318,7 @@ func _run(ctx context.Context) error {
 		startTime := time.Now()
 
 		for {
-			time.Sleep(statsInterval)
+			time.Sleep(interval)
 
 			eventCountsMutex.Lock()
 
@@ -316,7 +378,7 @@ func displayTable(
 	delta time.Duration,
 ) {
 	if len(eventCountsByType) == 0 {
-		fmt.Printf("\t(No recent events seen …)\n")
+		fmt.Printf("\tNo writes seen.\n")
 		return
 	}
 
