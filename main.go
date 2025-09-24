@@ -339,14 +339,10 @@ func _runChangeStream(ctx context.Context, connstr string, interval time.Duratio
 
 	startTime := time.Now()
 
-	cursorDoc := bson.D{
-		{"maxTimeMS", 0},
-	}
 	resp := db.RunCommand(
 		sctx,
 		bson.D{
 			{"aggregate", 1},
-			//{"cursor", cursorDoc},
 			{"cursor", bson.D{}},
 			{"pipeline", mongo.Pipeline{
 				{{"$changeStream", bson.D{
@@ -442,7 +438,7 @@ cursorLoop:
 			break cursorLoop
 		}
 
-		if err := cursor.GetNext(sctx, cursorDoc...); err != nil {
+		if err := cursor.GetNext(sctx); err != nil {
 			return fmt.Errorf("iterating change stream: %w", err)
 		}
 	}
