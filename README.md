@@ -2,9 +2,13 @@
 
 This tool reports various statistics around a MongoDB cluster’s write load.
 
+## Build Instructions
+
+Just run `go build`. 🙂
+
 ## Oplog Mode
 
-In its simplest form, this tool queries the oplog then writes a report, thus:
+In its simplest form, this tool queries the oplog then prints a report, thus:
 ```
 > ./mongo-measure-writes oplog 'mongodb://localhost:27017'
 
