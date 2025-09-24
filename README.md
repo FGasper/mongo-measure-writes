@@ -36,8 +36,9 @@ To read from a sharded cluster, this tool will try to connect to each
 shard individually and create a report like the above.
 
 This won’t work if the tool can’t connect to the shards via the connection
-strings that the mongos reports. In this case, read from the change stream
-instead.
+strings that the mongos reports. (This might happen if, for example, your
+mongos talks to its shards via private IPs.) In this case, read from the
+change stream instead.
 
 ## Change Stream Mode
 
