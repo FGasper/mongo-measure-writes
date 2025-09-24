@@ -7,10 +7,11 @@ import (
 	"maps"
 	"os"
 	"slices"
-	"sync"
 	"time"
 
+	"github.com/FGasper/mongo-measure-writes/cursor"
 	mmmath "github.com/FGasper/mongo-measure-writes/math"
+	"github.com/FGasper/mongo-measure-writes/resumetoken"
 	"github.com/olekukonko/tablewriter"
 	"github.com/samber/lo"
 	"github.com/urfave/cli/v3"
@@ -59,7 +60,7 @@ func main() {
 			{
 				Name:    "changestream",
 				Aliases: sliceOf("cs"),
-				Usage:   "measure via change stream (continually)",
+				Usage:   "measure via change stream",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},
@@ -70,6 +71,22 @@ func main() {
 					}
 
 					return _runChangeStream(ctx, uri, c.Duration(durationFlag.Name))
+				},
+			},
+			{
+				Name:    "tailchangestream",
+				Aliases: sliceOf("tcs"),
+				Usage:   "measure via change stream (continually)",
+				Flags: []cli.Flag{
+					&durationFlag,
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					uri, err := getURI(c)
+					if err != nil {
+						return err
+					}
+
+					return _runTailChangeStream(ctx, uri, c.Duration(durationFlag.Name))
 				},
 			},
 		},
@@ -144,13 +161,12 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 
 		// NB: This query seems to run much faster when querying on a full
 		// timestamp rather than just ts.t.
-		secondsAgo := uint32(time.Now().Add(-interval).Unix())
-		timestamp := bson.Timestamp{T: secondsAgo}
+		unixTimeStart := uint32(time.Now().Add(-interval).Unix())
 
 		return mongo.Pipeline{
 			// Stage 1: Match timestamp >= now - 5 sec
 			{{"$match", bson.D{
-				{"ts", bson.D{{"$gte", timestamp}}},
+				{"ts", bson.D{{"$gte", bson.Timestamp{T: unixTimeStart}}}},
 			}}},
 			// Stage 2: Match op in ["i", "u", "d"] or applyOps array
 			{{"$match", bson.D{
@@ -278,7 +294,7 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 		return fmt.Errorf("reading oplog aggregation: %w", err)
 	}
 
-	delta := time.Duration(maxTS.T-minTS.T) * time.Second
+	delta := time.Duration(1+maxTS.T-minTS.T) * time.Second
 
 	displayTable(
 		eventCountsByType,
@@ -313,104 +329,128 @@ func _runChangeStream(ctx context.Context, connstr string, interval time.Duratio
 
 	sctx := mongo.NewSessionContext(ctx, sess)
 
-	cs, err := client.Watch(
+	unixTimeStart := uint32(time.Now().Add(-interval).Unix())
+	startTS := bson.Timestamp{T: unixTimeStart}
+
+	db := client.Database("admin")
+
+	fmt.Printf("Gathering change events from the past %s …\n", interval)
+
+	startTime := time.Now()
+
+	cursorDoc := bson.D{
+		{"maxTimeMS", 0},
+	}
+	resp := db.RunCommand(
 		sctx,
-		mongo.Pipeline{
-			{{"$addFields", bson.D{
-				{"operationType", "$$REMOVE"},
-				{"op", bson.D{{"$cond", bson.D{
-					{"if", bson.D{{"$in", [2]any{
-						"$operationType",
-						eventsToTruncate,
+		bson.D{
+			{"aggregate", 1},
+			//{"cursor", cursorDoc},
+			{"cursor", bson.D{}},
+			{"pipeline", mongo.Pipeline{
+				{{"$changeStream", bson.D{
+					{"allChangesForCluster", true},
+					{"showSystemEvents", true},
+					{"showExpandedEvents", true},
+					{"startAtOperationTime", startTS},
+				}}},
+				{{"$match", bson.D{
+					{"clusterTime", bson.D{
+						{"$lte", bson.Timestamp{T: uint32(time.Now().Unix())}},
+					}},
+				}}},
+				{{"$addFields", bson.D{
+					{"operationType", "$$REMOVE"},
+					{"op", bson.D{{"$cond", bson.D{
+						{"if", bson.D{{"$in", [2]any{
+							"$operationType",
+							eventsToTruncate,
+						}}}},
+						{"then", bson.D{{"$substr",
+							[3]any{"$operationType", 0, 1},
+						}}},
+						{"else", "$operationType"},
 					}}}},
-					{"then", bson.D{{"$substr",
-						[3]any{"$operationType", 0, 1},
-					}}},
-					{"else", "$operationType"},
-				}}}},
-				{"size", bson.D{{"$bsonSize", "$$ROOT"}}},
-			}}},
-			{{"$project", bson.D{
-				{"_id", 1},
-				{"op", 1},
-				{"size", 1},
-				{"clusterTime", 1},
-			}}},
+					{"size", bson.D{{"$bsonSize", "$$ROOT"}}},
+				}}},
+				{{"$project", bson.D{
+					{"_id", 1},
+					{"op", 1},
+					{"size", 1},
+					{"clusterTime", 1},
+				}}},
+			}},
 		},
-		options.ChangeStream().
-			SetCustomPipeline(bson.M{
-				"showSystemEvents":   true,
-				"showExpandedEvents": true,
-			}),
 	)
+
+	cursor, err := cursor.New(db, resp)
 	if err != nil {
 		return fmt.Errorf("opening change stream: %w", err)
 	}
-	defer cs.Close(sctx)
-
-	fmt.Printf("Listening for change events. Stats showing every %s …\n", interval)
 
 	eventSizesByType := map[string]int{}
 	eventCountsByType := map[string]int{}
-	eventCountsMutex := sync.Mutex{}
-	var changeStreamLag uint32
-
-	go func() {
-		startTime := time.Now()
-
-		for {
-			time.Sleep(interval)
-
-			eventCountsMutex.Lock()
-
-			now := time.Now()
-			delta := now.Sub(startTime)
-
-			displayTable(eventCountsByType, eventSizesByType, delta)
-
-			fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
-
-			evacuateMap(eventCountsByType)
-			evacuateMap(eventSizesByType)
-
-			startTime = time.Now()
-
-			eventCountsMutex.Unlock()
-		}
-	}()
 
 	fullEventName := map[string]string{}
 	for _, eventName := range eventsToTruncate {
 		fullEventName[eventName[:1]] = eventName
 	}
 
-	for cs.Next(sctx) {
-		op := cs.Current.Lookup("op").StringValue()
+	var minUnixSecs, maxUnixSecs uint32
 
-		if fullOp, isShortened := fullEventName[op]; isShortened {
-			op = fullOp
+cursorLoop:
+	for {
+		if cursor.IsFinished() {
+			return fmt.Errorf("unexpected end of change stream")
 		}
 
-		eventCountsMutex.Lock()
-		eventCountsByType[op]++
-		eventSizesByType[op] += int(cs.Current.Lookup("size").AsInt64())
+		for _, event := range cursor.GetCurrentBatch() {
+			t, _ := event.Lookup("clusterTime").Timestamp()
 
-		sessTS, err := GetClusterTimeFromSession(sess)
+			if time.Unix(int64(t), 0).After(startTime) {
+				break cursorLoop
+			}
+
+			if minUnixSecs == 0 {
+				minUnixSecs = t
+			}
+
+			maxUnixSecs = t
+
+			op := event.Lookup("op").StringValue()
+
+			if fullOp, isShortened := fullEventName[op]; isShortened {
+				op = fullOp
+			}
+
+			eventCountsByType[op]++
+			eventSizesByType[op] += int(event.Lookup("size").AsInt64())
+		}
+
+		rt, hasToken := cursor.GetCursorExtra()["postBatchResumeToken"]
+		if !hasToken {
+			return fmt.Errorf("change stream lacks resume token??")
+		}
+
+		tokenTS, err := resumetoken.New(rt.Document()).Timestamp()
 		if err != nil {
-
-		} else {
-			eventT, _ := cs.Current.Lookup("clusterTime").Timestamp()
-
-			changeStreamLag = sessTS.T - eventT
+			return fmt.Errorf("parsing timestamp from change stream resume token")
 		}
 
-		eventCountsMutex.Unlock()
-	}
-	if cs.Err() != nil {
-		return fmt.Errorf("reading change stream: %w", cs.Err())
+		if time.Unix(int64(tokenTS.T), 0).After(startTime) {
+			break cursorLoop
+		}
+
+		if err := cursor.GetNext(sctx, cursorDoc...); err != nil {
+			return fmt.Errorf("iterating change stream: %w", err)
+		}
 	}
 
-	return fmt.Errorf("unexpected end of change stream")
+	delta := time.Duration(1+maxUnixSecs-minUnixSecs) * time.Second
+
+	displayTable(eventCountsByType, eventSizesByType, delta)
+
+	return nil
 }
 
 func displayTable(
@@ -418,6 +458,10 @@ func displayTable(
 	eventSizesByType map[string]int,
 	delta time.Duration,
 ) {
+	if delta == 0 {
+		panic("nonzero delta is nonsensical!")
+	}
+
 	if len(eventCountsByType) == 0 {
 		fmt.Printf("\tNo writes seen.\n")
 		return
@@ -428,8 +472,8 @@ func displayTable(
 
 	fmt.Printf(
 		"\n%s ops/sec (%s/sec; avg: %s)\n",
-		FmtReal((mmmath.DivideToF64(allEventsCount, 1+delta.Seconds()))),
-		FmtBytes(mmmath.DivideToF64(totalSize, 1+delta.Seconds())),
+		FmtReal((mmmath.DivideToF64(allEventsCount, delta.Seconds()))),
+		FmtBytes(mmmath.DivideToF64(totalSize, delta.Seconds())),
 		FmtBytes(mmmath.DivideToF64(totalSize, allEventsCount)),
 	)
 
