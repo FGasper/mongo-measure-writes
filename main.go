@@ -22,7 +22,7 @@ func main() {
 	getURI := func(c *cli.Command) (string, error) {
 		uri := c.Args().First()
 		if uri == "" {
-			return "", fmt.Errorf("give a connection string")
+			return "", fmt.Errorf("connection string required")
 		}
 
 		return uri, nil
@@ -42,7 +42,7 @@ func main() {
 			{
 				Name:    "oplog",
 				Aliases: sliceOf("o"),
-				Usage:   "measure via oplog",
+				Usage:   "measure via oplog (once)",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},
@@ -58,7 +58,7 @@ func main() {
 			{
 				Name:    "changestream",
 				Aliases: sliceOf("cs"),
-				Usage:   "measure via change stream",
+				Usage:   "measure via change stream (continually)",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},
