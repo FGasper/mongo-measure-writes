@@ -2,10 +2,11 @@
 
 This tool reports various statistics around a MongoDB cluster’s write load.
 
-## Build Instructions
+## Build & Usage Instructions
 ```
 go build
 ```
+Then type `./mongo-measure-writes --help`.
 
 ## Oplog Mode
 
