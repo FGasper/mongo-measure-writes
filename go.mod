@@ -1,4 +1,4 @@
-module github.com/FGasper/mongo-measure-change-stream
+module github.com/FGasper/mongo-measure-writes
 
 go 1.24.4
 

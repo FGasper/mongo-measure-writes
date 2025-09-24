@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	mmmath "github.com/FGasper/mongo-measure-change-stream/math"
+	mmmath "github.com/FGasper/mongo-measure-writes/math"
 	"github.com/olekukonko/tablewriter"
 	"github.com/samber/lo"
 	"github.com/urfave/cli/v3"
