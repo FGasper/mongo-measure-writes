@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -95,8 +96,48 @@ func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) 
 		return err
 	}
 
+	isSharded, err := isSharded(ctx, client)
+	if err != nil {
+		return fmt.Errorf("determining whether cluster is sharded: %w", err)
+	}
+
+	if isSharded {
+		fmt.Println("Connection string refers to a mongos. Will try to connect to individual shards …")
+
+		shardInfos, err := getShards(ctx, client)
+		if err != nil {
+			return fmt.Errorf("fetching shards’ connection strings: %w", err)
+		}
+
+		slices.SortFunc(
+			shardInfos,
+			func(a, b ShardInfo) int {
+				return cmp.Compare(a.Name, b.Name)
+			},
+		)
+
+		for _, shard := range shardInfos {
+			fmt.Printf("Querying shard %s’s oplog for write stats over the last %s …\n", shard.Name, interval)
+
+			shardClient, err := getClient("mongodb://" + shard.ConnStr)
+
+			if err != nil {
+				return fmt.Errorf("creating connection to shard %#q (%#q): %w", shard.Name, shard.ConnStr, err)
+			}
+
+			err = printOplogStats(ctx, shardClient, interval)
+			if err != nil {
+				return fmt.Errorf("getting shard %s’s oplog stats: %w", shard.Name, err)
+			}
+		}
+	}
+
 	fmt.Printf("Querying the oplog for write stats over the last %s …\n", interval)
 
+	return printOplogStats(ctx, client, interval)
+}
+
+func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Duration) error {
 	coll := client.Database("local").Collection("oplog.rs")
 
 	createPipeline := func() mongo.Pipeline {
