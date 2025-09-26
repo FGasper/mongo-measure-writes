@@ -135,9 +135,9 @@ func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) 
 		)
 
 		for _, shard := range shardInfos {
-			fmt.Printf("Querying shard %s’s oplog for write stats over the last %s …\n", shard.Name, interval)
+			fmt.Printf("Querying shard %#q’s oplog for write stats over the last %s (%s) …\n", shard.Name, interval, shard.ConnStr)
 
-			shardClient, err := getClient("mongodb://" + shard.ConnStr)
+			shardClient, err := getClient(shard.ConnStr)
 
 			if err != nil {
 				return fmt.Errorf("creating connection to shard %#q (%#q): %w", shard.Name, shard.ConnStr, err)
@@ -148,6 +148,8 @@ func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) 
 				return fmt.Errorf("getting shard %s’s oplog stats: %w", shard.Name, err)
 			}
 		}
+
+		return nil
 	}
 
 	fmt.Printf("Querying the oplog for write stats over the last %s …\n", interval)

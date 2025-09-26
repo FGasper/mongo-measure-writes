@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
+	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
@@ -59,6 +61,7 @@ func getShards(ctx context.Context, client *mongo.Client) ([]ShardInfo, error) {
 	}
 
 	shardMap := map[string]ShardInfo{}
+	fmt.Printf("shardMap: %v\n", parsedShardMap.ConnStrings)
 
 	for connstr, shardName := range parsedShardMap.ConnStrings {
 		if !slices.Contains(shardNames, shardName) {
@@ -79,5 +82,19 @@ func getShards(ctx context.Context, client *mongo.Client) ([]ShardInfo, error) {
 		}
 	}
 
-	return slices.Collect(maps.Values(shardMap)), nil
+	shardInfos := lo.Map(
+		slices.Collect(maps.Values(shardMap)),
+		func(si ShardInfo, _ int) ShardInfo {
+			replSetName, hosts, found := strings.Cut(si.ConnStr, "/")
+			if !found {
+				panic(fmt.Sprintf("Bad shard info: %+v", si))
+			}
+
+			si.ConnStr = fmt.Sprintf("mongodb://%s/?replicaSet=%s", hosts, replSetName)
+
+			return si
+		},
+	)
+
+	return shardInfos, nil
 }
