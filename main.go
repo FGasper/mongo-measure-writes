@@ -96,12 +96,7 @@ func main() {
 				Aliases: sliceOf("tss"),
 				Usage:   "measure via serverStatus (continually)",
 				Flags: []cli.Flag{
-					&cli.DurationFlag{
-						Name:    "interval",
-						Aliases: sliceOf("i"),
-						Usage:   "interval between serverStatus calls",
-						Value:   30 * time.Second,
-					},
+					&durationFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -109,7 +104,7 @@ func main() {
 						return err
 					}
 
-					return _runTailServerStatus(ctx, uri, c.Duration("interval"))
+					return _runTailServerStatus(ctx, uri, c.Duration(durationFlag.Name))
 				},
 			},
 		},
@@ -121,7 +116,9 @@ func main() {
 	}
 }
 
-func _runTailServerStatus(ctx context.Context, connstr string, interval time.Duration) error {
+func _runTailServerStatus(ctx context.Context, connstr string, window time.Duration) error {
+	interval := window / 10
+
 	client, err := getClient(connstr)
 	if err != nil {
 		return err
@@ -148,7 +145,6 @@ func _runTailServerStatus(ctx context.Context, connstr string, interval time.Dur
 	}
 
 	var samples []ssSample
-	const maxSamples = 5000
 
 	for {
 		ss := client.Database("admin").RunCommand(
@@ -165,8 +161,12 @@ func _runTailServerStatus(ctx context.Context, connstr string, interval time.Dur
 			return fmt.Errorf("parsing server status: %w", err)
 		}
 
-		samples = append(samples, ssSample{time.Now(), newSS})
-		for len(samples) > maxSamples {
+		now := time.Now()
+
+		minSampleTime := now.Add(-window)
+
+		samples = append(samples, ssSample{now, newSS})
+		for samples[0].time.Before(minSampleTime) {
 			samples = samples[1:]
 		}
 
