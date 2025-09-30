@@ -398,23 +398,30 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 			}}},
 
 			// We want to know if "u" ops are simple updates or replacements.
+			// Thus we append either “/u” or “/r”.
 			{{"$set", bson.D{
 				{"ops.op", bson.D{
 					{"$cond", bson.D{
-						{"if", bson.D{{"$and", []bson.D{
-							{{"$in", bson.A{
-								"$ops.op",
-								bson.A{"u", "applyOps.u"},
-							}}},
-							{{"$ne", bson.A{
-								bson.D{{"$type", "$o._id"}},
-								"missing",
-							}}},
+						{"if", bson.D{{"$in", bson.A{
+							"$ops.op",
+							bson.A{"u", "applyOps.u"},
 						}}}},
 						{"then", bson.D{
 							{"$concat", bson.A{
 								"$ops.op",
-								"/r",
+								"/",
+								bson.D{
+									{"$cond", bson.D{
+										{"if", bson.D{
+											{"$eq", bson.A{
+												bson.D{{"$type", "$o._id"}},
+												"missing",
+											}},
+										}},
+										{"then", "r"},
+										{"else", "u"},
+									}},
+								},
 							}},
 						}},
 						{"else", "$ops.op"},
