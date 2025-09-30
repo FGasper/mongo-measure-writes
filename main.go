@@ -335,11 +335,12 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 		unixTimeStart := uint32(time.Now().Add(-interval).Unix())
 
 		return mongo.Pipeline{
-			// Stage 1: Match timestamp >= now - 5 sec
+			// Match timestamp
 			{{"$match", bson.D{
 				{"ts", bson.D{{"$gte", bson.Timestamp{T: unixTimeStart}}}},
 			}}},
-			// Stage 2: Match op in ["i", "u", "d"] or applyOps array
+
+			// Match op in ["i", "u", "d"] or applyOps array
 			{{"$match", bson.D{
 				{"$or", bson.A{
 					bson.D{
@@ -352,7 +353,8 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 					},
 				}},
 			}}},
-			// Stage 3: Normalize to ops array
+
+			// Normalize to ops array
 			{{"$addFields", bson.D{
 				{"ops", bson.D{
 					{"$cond", bson.D{
@@ -381,9 +383,11 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 					}},
 				}},
 			}}},
-			// Stage 4: Unwind ops
+
+			// Unwind ops
 			{{"$unwind", "$ops"}},
-			// Stage 5: Match sub-ops of interest
+
+			// Match sub-ops of interest
 			{{"$match", bson.D{
 				{"ops.op", bson.D{{"$in", lo.Flatten(
 					sliceOf(
@@ -397,9 +401,10 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 				}}},
 			}}},
 
-			// We want to know if "u" ops are simple updates or replacements.
-			// Thus we append either “/u” or “/r”.
-			{{"$set", bson.D{
+			// Add BSON size per op, and append either /u or /r to op:u.
+			{{"$addFields", bson.D{
+				{"size", bson.D{{"$bsonSize", "$ops"}}},
+
 				{"ops.op", bson.D{
 					{"$cond", bson.D{
 						{"if", bson.D{{"$in", bson.A{
@@ -428,11 +433,8 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 					}},
 				}},
 			}}},
-			// Stage 6: Add BSON size per op
-			{{"$addFields", bson.D{
-				{"size", bson.D{{"$bsonSize", "$ops"}}},
-			}}},
-			// Stage 7: Group by op type
+
+			// Group by op type
 			{{"$group", bson.D{
 				{"_id", "$ops.op"},
 				{"count", bson.D{{"$sum", 1}}},
@@ -440,7 +442,8 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 				{"minTs", bson.D{{"$min", "$ts"}}},
 				{"maxTs", bson.D{{"$max", "$ts"}}},
 			}}},
-			// Stage 8: Final projection
+
+			// Final projection
 			{{"$project", bson.D{
 				{"op", "$_id"},
 				{"count", 1},
