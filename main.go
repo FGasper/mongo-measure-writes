@@ -396,6 +396,31 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 				),
 				}}},
 			}}},
+
+			// We want to know if "u" ops are simple updates or replacements.
+			{{"$set", bson.D{
+				{"ops.op", bson.D{
+					{"$cond", bson.D{
+						{"if", bson.D{{"$and", []bson.D{
+							{{"$in", bson.A{
+								"$ops.op",
+								bson.A{"u", "applyOps.u"},
+							}}},
+							{{"$ne", bson.A{
+								bson.D{{"$type", "$o._id"}},
+								"missing",
+							}}},
+						}}}},
+						{"then", bson.D{
+							{"$concat", bson.A{
+								"$ops.op",
+								"/r",
+							}},
+						}},
+						{"else", "$ops.op"},
+					}},
+				}},
+			}}},
 			// Stage 6: Add BSON size per op
 			{{"$addFields", bson.D{
 				{"size", bson.D{{"$bsonSize", "$ops"}}},
@@ -646,11 +671,10 @@ func displayTable(
 
 	table := tablewriter.NewWriter(os.Stdout)
 	table.Header([]string{
-		"Event Type",
+		"Event",
 		"Count",
-		"Size",
-		"% of total count",
-		"% of total size",
+		"Total Size",
+		"Avg Size",
 	})
 
 	eventTypes := slices.Sorted(maps.Keys(eventCountsByType))
@@ -659,16 +683,23 @@ func displayTable(
 		countFraction := mmmath.DivideToF64(eventCountsByType[eventType], allEventsCount)
 		sizeFraction := mmmath.DivideToF64(eventSizesByType[eventType], totalSize)
 
-		table.Append([]string{
+		lo.Must0(table.Append([]string{
 			eventType,
-			FmtReal(eventCountsByType[eventType]),
-			FmtBytes(eventSizesByType[eventType]),
-			FmtReal(100*countFraction) + "%",
-			FmtReal(100*sizeFraction) + "%",
-		})
+			fmt.Sprintf(
+				"%s (%s%%)",
+				FmtReal(eventCountsByType[eventType]),
+				FmtReal(100*countFraction),
+			),
+			fmt.Sprintf(
+				"%s (%s%%)",
+				FmtBytes(eventSizesByType[eventType]),
+				FmtReal(100*sizeFraction),
+			),
+			FmtBytes(mmmath.DivideToF64(eventSizesByType[eventType], eventCountsByType[eventType])),
+		}))
 	}
 
-	table.Render()
+	lo.Must0(table.Render())
 }
 
 func evacuateMap[K comparable, V any, M ~map[K]V](theMap M) {
