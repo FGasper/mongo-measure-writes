@@ -319,11 +319,6 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 			{"awaitData", true},
 			{"projection", bson.D{
 				{"ts", 1},
-				/*
-					{"ns", 1},
-					{"o", 1},
-					{"o2", 1},
-				*/
 
 				{"op", makeSuffixedOpFieldExpr("$$ROOT")},
 
@@ -372,11 +367,18 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 				return
 			case <-ticker.C:
 				eventsMutex.Lock()
+
 				counts := maps.Clone(eventCountsByType)
 				sizes := maps.Clone(eventSizesByType)
+
+				evacuateMap(eventCountsByType)
+				evacuateMap(eventSizesByType)
+
 				eventsMutex.Unlock()
 
 				displayTable(counts, sizes, time.Since(start))
+
+				start = time.Now()
 
 				fmt.Printf("Lag: %s\n\n", lag)
 			}
@@ -389,12 +391,6 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 		eventsMutex.Lock()
 
 		for i, op := range batch {
-			/*
-				if mustExtract[string](op, "ns") != "admin.$cmd" {
-					fmt.Printf("====== op: %v\n\n", op)
-				}
-			*/
-
 			opType := mustExtract[string](op, "op")
 
 			switch opType {
