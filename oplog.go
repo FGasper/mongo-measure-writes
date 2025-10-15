@@ -16,20 +16,37 @@ var eventsToTruncate = sliceOf(
 
 var oplogOps = sliceOf("i", "u", "d")
 
-var oplogQuery = bson.D{
-	{"$or", bson.A{
-		bson.D{
-			{"op", bson.D{{"$in", oplogOps}}},
-		},
-		bson.D{
-			{"op", "c"},
-			{"ns", "admin.$cmd"},
-			{"o.applyOps", bson.D{{"$type", "array"}}},
-		},
-	}},
+var oplogOpsWithApplyOpsPrefix = lo.Flatten(
+	sliceOf(
+		oplogOps,
+		lo.Map(
+			oplogOps,
+			func(op string, _ int) string { return "applyOps." + op },
+		),
+	),
+)
+
+func makeOplogSingleOpFilterExpr(opRef string, opsToAccept []string) any {
+	return agg.And{
+		agg.In(opRef+".op", opsToAccept...),
+		agg.Not{agg.Eq(
+			agg.SubstrBytes{opRef + ".ns", 0, 7},
+			"config.",
+		)},
+	}
 }
 
-func makeOpFieldExpr(opRef string) bson.D {
+var oplogQueryExpr = agg.Or{
+	makeOplogSingleOpFilterExpr("$$ROOT", oplogOps),
+	agg.And{
+		agg.Eq("$op", "c"),
+		agg.Eq("$ns", "admin.$cmd"),
+		agg.Eq(agg.Type("$o.applyOps"), "array"),
+	},
+}
+
+// This appends /u or /r to “u” oplog events.
+func makeSuffixedOpFieldExpr(opRef string) bson.D {
 	return agg.Cond{
 		If: agg.In(opRef+".op", "u", "applyOps.u"),
 		Then: agg.Concat(
@@ -47,34 +64,26 @@ func makeOpFieldExpr(opRef string) bson.D {
 
 var oplogUnrollFormatStages = mongo.Pipeline{
 	// Match op in ["i", "u", "d"] or applyOps array
-	{{"$match", oplogQuery}},
+	{{"$match", bson.D{{"$expr", oplogQueryExpr}}}},
 
 	// Normalize to ops array
 	{{"$addFields", bson.D{
-		{"ops", bson.D{
-			{"$cond", bson.D{
-				{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
-				{"then", bson.D{
-					{"$map", bson.D{
-						{"input", "$o.applyOps"},
-						{"as", "opEntry"},
-						{"in", bson.D{
-							{"$mergeObjects", bson.A{
-								"$$opEntry",
-								bson.D{
-									{"op", bson.D{
-										{"$concat", bson.A{
-											"applyOps.",
-											"$$opEntry.op",
-										}},
-									}},
-								},
-							}},
-						}},
-					}},
-				}},
-				{"else", bson.A{"$$ROOT"}},
-			}},
+		{"ops", agg.Cond{
+			If: agg.Eq("$op", "c"),
+			Then: agg.Map{
+				Input: "$o.applyOps",
+				As:    "opEntry",
+				In: agg.MergeObjects{
+					"$$opEntry",
+					bson.D{
+						{"op", agg.Concat(
+							"applyOps.",
+							"$$opEntry.op",
+						)},
+					},
+				},
+			},
+			Else: bson.A{"$$ROOT"},
 		}},
 	}}},
 
@@ -83,21 +92,12 @@ var oplogUnrollFormatStages = mongo.Pipeline{
 
 	// Match sub-ops of interest
 	{{"$match", bson.D{
-		{"ops.op", bson.D{{"$in", lo.Flatten(
-			sliceOf(
-				oplogOps,
-				lo.Map(
-					oplogOps,
-					func(op string, _ int) string { return "applyOps." + op },
-				),
-			),
-		),
-		}}},
+		{"$expr", makeOplogSingleOpFilterExpr("$ops", oplogOpsWithApplyOpsPrefix)},
 	}}},
 
 	// Add BSON size per op, and append either /u or /r to op:u.
 	{{"$addFields", bson.D{
 		{"size", bson.D{{"$bsonSize", "$ops"}}},
-		{"ops.op", makeOpFieldExpr("$ops")},
+		{"ops.op", makeSuffixedOpFieldExpr("$ops")},
 	}}},
 }

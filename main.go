@@ -299,19 +299,33 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 		return fmt.Errorf("cannot tail oplog on a sharded cluster")
 	}
 
+	startUnixTime := time.Now().Unix()
+
 	db := client.Database("local")
 
 	resp := db.RunCommand(
 		ctx,
 		bson.D{
 			{"find", "oplog.rs"},
-			{"filter", oplogQuery},
+			{"filter", agg.And{
+				bson.D{
+					{"ts", bson.D{
+						{"$gte", bson.Timestamp{T: uint32(startUnixTime)}},
+					}},
+				},
+				bson.D{{"$expr", oplogQueryExpr}},
+			}},
 			{"tailable", true},
 			{"awaitData", true},
 			{"projection", bson.D{
 				{"ts", 1},
+				/*
+					{"ns", 1},
+					{"o", 1},
+					{"o2", 1},
+				*/
 
-				{"op", makeOpFieldExpr("$$ROOT")},
+				{"op", makeSuffixedOpFieldExpr("$$ROOT")},
 
 				{"size", agg.Cond{
 					If:   agg.Eq("$op", "c"),
@@ -325,10 +339,7 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 						Input: "$o.applyOps",
 						As:    "opEntry",
 						In: bson.D{
-							{"op", agg.Concat(
-								"applyOps.",
-								makeOpFieldExpr("$$opEntry"),
-							)},
+							{"op", makeSuffixedOpFieldExpr("$$opEntry")},
 							{"size", agg.BSONSize("$$opEntry")},
 						},
 					},
@@ -343,13 +354,15 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 		return fmt.Errorf("opening oplog cursor: %w", err)
 	}
 
+	fmt.Printf("Listening for oplog events. Stats showing every %s …\n", interval)
+
 	eventsMutex := sync.Mutex{}
 	eventSizesByType := map[string]int{}
 	eventCountsByType := map[string]int{}
 	var lag time.Duration
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(interval)
 
 		start := time.Now()
 
@@ -376,6 +389,12 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 		eventsMutex.Lock()
 
 		for i, op := range batch {
+			/*
+				if mustExtract[string](op, "ns") != "admin.$cmd" {
+					fmt.Printf("====== op: %v\n\n", op)
+				}
+			*/
+
 			opType := mustExtract[string](op, "op")
 
 			switch opType {
@@ -383,7 +402,7 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 				ops := mustExtract[[]bson.Raw](op, "ops")
 
 				for _, subOp := range ops {
-					opType := mustExtract[string](subOp, "op")
+					opType := "applyOps." + mustExtract[string](subOp, "op")
 					eventCountsByType[opType]++
 					eventSizesByType[opType] += mustExtract[int](subOp, "size")
 				}
@@ -788,17 +807,12 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 		mongo.Pipeline{
 			{{"$addFields", bson.D{
 				{"operationType", "$$REMOVE"},
-				{"op", bson.D{{"$cond", bson.D{
-					{"if", bson.D{{"$in", [2]any{
-						"$operationType",
-						eventsToTruncate,
-					}}}},
-					{"then", bson.D{{"$substr",
-						[3]any{"$operationType", 0, 1},
-					}}},
-					{"else", "$operationType"},
-				}}}},
-				{"size", bson.D{{"$bsonSize", "$$ROOT"}}},
+				{"op", agg.Cond{
+					If:   agg.In("$operationType", eventsToTruncate...),
+					Then: agg.SubstrBytes{"$operationType", 0, 1},
+					Else: "$operationType",
+				}},
+				{"size", agg.BSONSize("$$ROOT")},
 			}}},
 			{{"$project", bson.D{
 				{"_id", 1},
