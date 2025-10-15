@@ -1,7 +1,16 @@
 package main
 
 import (
+	"cmp"
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"sync"
+	"time"
+
 	"github.com/FGasper/mongo-measure-writes/agg"
+	"github.com/FGasper/mongo-measure-writes/cursor"
 	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -100,4 +109,294 @@ var oplogUnrollFormatStages = mongo.Pipeline{
 		{"size", bson.D{{"$bsonSize", "$ops"}}},
 		{"ops.op", makeSuffixedOpFieldExpr("$ops")},
 	}}},
+}
+
+func _runTailOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
+	client, err := getClient(connstr)
+	if err != nil {
+		return err
+	}
+
+	isSharded, err := isSharded(ctx, client)
+	if err != nil {
+		return fmt.Errorf("determining whether cluster is sharded: %w", err)
+	}
+
+	if isSharded {
+		return fmt.Errorf("cannot tail oplog on a sharded cluster")
+	}
+
+	startUnixTime := time.Now().Unix()
+
+	db := client.Database("local")
+
+	resp := db.RunCommand(
+		ctx,
+		bson.D{
+			{"find", "oplog.rs"},
+			{"filter", agg.And{
+				bson.D{
+					{"ts", bson.D{
+						{"$gte", bson.Timestamp{T: uint32(startUnixTime)}},
+					}},
+				},
+				bson.D{{"$expr", oplogQueryExpr}},
+			}},
+			{"tailable", true},
+			{"awaitData", true},
+			{"projection", bson.D{
+				{"ts", 1},
+
+				{"op", makeSuffixedOpFieldExpr("$$ROOT")},
+
+				{"size", agg.Cond{
+					If:   agg.Eq("$op", "c"),
+					Then: "$$REMOVE",
+					Else: agg.BSONSize("$$ROOT"),
+				}},
+
+				{"ops", agg.Cond{
+					If: agg.Eq("$op", "c"),
+					Then: agg.Map{
+						Input: "$o.applyOps",
+						As:    "opEntry",
+						In: bson.D{
+							{"op", makeSuffixedOpFieldExpr("$$opEntry")},
+							{"size", agg.BSONSize("$$opEntry")},
+						},
+					},
+				}},
+			}},
+		},
+	)
+
+	cursor, err := cursor.New(db, resp)
+
+	if err != nil {
+		return fmt.Errorf("opening oplog cursor: %w", err)
+	}
+
+	fmt.Printf("Listening for oplog events. Stats showing every %s …\n", interval)
+
+	eventsMutex := sync.Mutex{}
+	eventSizesByType := map[string]int{}
+	eventCountsByType := map[string]int{}
+	var lag time.Duration
+
+	go func() {
+		ticker := time.NewTicker(interval)
+
+		start := time.Now()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				eventsMutex.Lock()
+
+				counts := maps.Clone(eventCountsByType)
+				sizes := maps.Clone(eventSizesByType)
+
+				evacuateMap(eventCountsByType)
+				evacuateMap(eventSizesByType)
+
+				eventsMutex.Unlock()
+
+				displayTable(counts, sizes, time.Since(start))
+
+				start = time.Now()
+
+				fmt.Printf("Lag: %s\n\n", lag)
+			}
+		}
+	}()
+
+	for !cursor.IsFinished() {
+		batch := cursor.GetCurrentBatch()
+
+		eventsMutex.Lock()
+
+		for i, op := range batch {
+			opType := mustExtract[string](op, "op")
+
+			switch opType {
+			case "c":
+				ops := mustExtract[[]bson.Raw](op, "ops")
+
+				for _, subOp := range ops {
+					opType := "applyOps." + mustExtract[string](subOp, "op")
+					eventCountsByType[opType]++
+					eventSizesByType[opType] += mustExtract[int](subOp, "size")
+				}
+			default:
+				eventCountsByType[opType]++
+				eventSizesByType[opType] += mustExtract[int](op, "size")
+			}
+
+			if i == len(batch)-1 {
+				ts := mustExtract[bson.Timestamp](op, "ts")
+
+				ct := mustExtract[bson.Timestamp](
+					cursor.GetExtra()["$clusterTime"].Document(),
+					"clusterTime",
+				)
+
+				lag = time.Second * time.Duration(int(ct.T)-int(ts.T))
+			}
+		}
+
+		eventsMutex.Unlock()
+
+		if err := cursor.GetNext(ctx); err != nil {
+			return fmt.Errorf("reading oplog: %w", err)
+		}
+	}
+
+	panic("cursor should never finish!")
+}
+
+func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
+	client, err := getClient(connstr)
+	if err != nil {
+		return err
+	}
+
+	isSharded, err := isSharded(ctx, client)
+	if err != nil {
+		return fmt.Errorf("determining whether cluster is sharded: %w", err)
+	}
+
+	if isSharded {
+		fmt.Println("Connection string refers to a mongos. Will try to connect to individual shards …")
+
+		shardInfos, err := getShards(ctx, client)
+		if err != nil {
+			return fmt.Errorf("fetching shards’ connection strings: %w", err)
+		}
+
+		slices.SortFunc(
+			shardInfos,
+			func(a, b ShardInfo) int {
+				return cmp.Compare(a.Name, b.Name)
+			},
+		)
+
+		for _, shard := range shardInfos {
+			fmt.Printf("Querying shard %#q’s oplog for write stats over the last %s (%s) …\n", shard.Name, interval, shard.ConnStr)
+
+			shardClient, err := getClient(shard.ConnStr)
+
+			if err != nil {
+				return fmt.Errorf("creating connection to shard %#q (%#q): %w", shard.Name, shard.ConnStr, err)
+			}
+
+			err = fetchAndPrintOplogStats(ctx, shardClient, interval)
+			if err != nil {
+				return fmt.Errorf("getting shard %s’s oplog stats: %w", shard.Name, err)
+			}
+		}
+
+		return nil
+	}
+
+	fmt.Printf("Querying the oplog for write stats over the last %s …\n", interval)
+
+	return fetchAndPrintOplogStats(ctx, client, interval)
+}
+
+func fetchAndPrintOplogStats(ctx context.Context, client *mongo.Client, interval time.Duration) error {
+	coll := client.Database("local").Collection("oplog.rs")
+
+	createPipeline := func() mongo.Pipeline {
+
+		// NB: This query seems to run much faster when querying on a full
+		// timestamp rather than just ts.t.
+		unixTimeStart := uint32(time.Now().Add(-interval).Unix())
+
+		return lo.Flatten([]mongo.Pipeline{
+			{
+				// Match timestamp
+				{{"$match", bson.D{
+					{"ts", bson.D{{"$gte", bson.Timestamp{T: unixTimeStart}}}},
+				}}},
+			},
+			oplogUnrollFormatStages,
+			{
+				// Group by op type
+				{{"$group", bson.D{
+					{"_id", "$ops.op"},
+					{"count", bson.D{{"$sum", 1}}},
+					{"totalSize", bson.D{{"$sum", "$size"}}},
+					{"minTs", bson.D{{"$min", "$ts"}}},
+					{"maxTs", bson.D{{"$max", "$ts"}}},
+				}}},
+
+				// Final projection
+				{{"$project", bson.D{
+					{"op", "$_id"},
+					{"count", 1},
+					{"totalSize", 1},
+					{"minTs", 1},
+					{"maxTs", 1},
+					{"_id", 0},
+				}}},
+			},
+		})
+	}
+
+	cursor, err := coll.Aggregate(ctx, createPipeline())
+	if err != nil {
+		return fmt.Errorf("querying oplog: %w", err)
+	}
+
+	defer cursor.Close(ctx)
+
+	var minTS, maxTS bson.Timestamp
+	eventSizesByType := map[string]int{}
+	eventCountsByType := map[string]int{}
+
+	for cursor.Next(ctx) {
+		decoded := struct {
+			Op        string
+			Count     int
+			TotalSize int
+			MinTS     bson.Timestamp
+			MaxTS     bson.Timestamp
+		}{}
+
+		if err := cursor.Decode(&decoded); err != nil {
+			return fmt.Errorf("decoding oplog aggregation: %w", err)
+		}
+
+		eventSizesByType[decoded.Op] = decoded.TotalSize
+		eventCountsByType[decoded.Op] = decoded.Count
+
+		if minTS.IsZero() {
+			minTS = decoded.MinTS
+		} else {
+			minTS = lo.MinBy(
+				sliceOf(minTS, decoded.MinTS),
+				bson.Timestamp.Before,
+			)
+		}
+
+		maxTS = lo.MaxBy(
+			sliceOf(maxTS, decoded.MaxTS),
+			bson.Timestamp.After,
+		)
+	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("reading oplog aggregation: %w", err)
+	}
+
+	delta := time.Duration(1+maxTS.T-minTS.T) * time.Second
+
+	displayTable(
+		eventCountsByType,
+		eventSizesByType,
+		delta,
+	)
+
+	return nil
 }
