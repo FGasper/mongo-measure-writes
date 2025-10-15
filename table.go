@@ -22,7 +22,7 @@ func displayTable(
 	}
 
 	if len(eventCountsByType) == 0 {
-		fmt.Printf("\tNo writes seen.\n")
+		fmt.Printf("No writes seen.\n")
 		return
 	}
 
