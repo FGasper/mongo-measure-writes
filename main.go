@@ -31,9 +31,9 @@ func main() {
 		Usage: "Measure MongoDB document writes per second",
 		Commands: []*cli.Command{
 			{
-				Name:    "oplog",
-				Aliases: sliceOf("o"),
-				Usage:   "measure via oplog (once)",
+				Name:    "aggregate-oplog",
+				Aliases: sliceOf("ao"),
+				Usage:   "measure by reading the oplog once",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},
@@ -47,7 +47,7 @@ func main() {
 				},
 			},
 			{
-				Name:    "tailoplog",
+				Name:    "tail-oplog",
 				Aliases: sliceOf("to"),
 				Usage:   "measure by tailing the oplog",
 				Flags: []cli.Flag{
@@ -65,7 +65,7 @@ func main() {
 			{
 				Name:    "changestream",
 				Aliases: sliceOf("cs"),
-				Usage:   "measure via change stream",
+				Usage:   "measure by reading a change stream (once)",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},
@@ -79,9 +79,9 @@ func main() {
 				},
 			},
 			{
-				Name:    "changestreamloop",
-				Aliases: sliceOf("csl"),
-				Usage:   "measure via change stream (continually)",
+				Name:    "tail-changestream",
+				Aliases: sliceOf("tcs"),
+				Usage:   "measure by tailing a change stream",
 				Flags: []cli.Flag{
 					&durationFlag,
 				},

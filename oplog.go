@@ -140,7 +140,10 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 						{"$gte", bson.Timestamp{T: uint32(startUnixTime)}},
 					}},
 				},
-				bson.D{{"$expr", oplogQueryExpr}},
+				bson.D{{"$expr", agg.Or{
+					oplogQueryExpr,
+					agg.Eq("$op", "n"),
+				}}},
 			}},
 			{"tailable", true},
 			{"awaitData", true},
@@ -165,6 +168,7 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 							{"size", agg.BSONSize("$$opEntry")},
 						},
 					},
+					Else: "$$REMOVE",
 				}},
 			}},
 		},
@@ -229,6 +233,9 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 					eventCountsByType[opType]++
 					eventSizesByType[opType] += mustExtract[int](subOp, "size")
 				}
+			case "n":
+				// There is nothing to count; this is just here so that
+				// reported lag doesn’t balloon in the event of quiesced writes.
 			default:
 				eventCountsByType[opType]++
 				eventSizesByType[opType] += mustExtract[int](op, "size")
