@@ -82,7 +82,7 @@ var _ bson.Marshaler = MergeObjects{}
 
 func (m MergeObjects) MarshalBSON() ([]byte, error) {
 	return bson.Marshal(bson.D{
-		{"$mergeObjects", m},
+		{"$mergeObjects", []any(m)},
 	})
 }
 
