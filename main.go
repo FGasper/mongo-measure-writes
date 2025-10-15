@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/FGasper/mongo-measure-writes/agg"
 	"github.com/FGasper/mongo-measure-writes/cursor"
 	mmmath "github.com/FGasper/mongo-measure-writes/math"
 	"github.com/FGasper/mongo-measure-writes/resumetoken"
@@ -60,6 +61,22 @@ func main() {
 				},
 			},
 			{
+				Name:    "tailoplog",
+				Aliases: sliceOf("to"),
+				Usage:   "measure by tailing the oplog",
+				Flags: []cli.Flag{
+					&durationFlag,
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					uri, err := getURI(c)
+					if err != nil {
+						return err
+					}
+
+					return _runTailOplogMode(ctx, uri, c.Duration(durationFlag.Name))
+				},
+			},
+			{
 				Name:    "changestream",
 				Aliases: sliceOf("cs"),
 				Usage:   "measure via change stream",
@@ -76,8 +93,8 @@ func main() {
 				},
 			},
 			{
-				Name:    "tailchangestream",
-				Aliases: sliceOf("tcs"),
+				Name:    "changestreamloop",
+				Aliases: sliceOf("csl"),
 				Usage:   "measure via change stream (continually)",
 				Flags: []cli.Flag{
 					&durationFlag,
@@ -88,12 +105,12 @@ func main() {
 						return err
 					}
 
-					return _runTailChangeStream(ctx, uri, c.Duration(durationFlag.Name))
+					return _runChangeStreamLoop(ctx, uri, c.Duration(durationFlag.Name))
 				},
 			},
 			{
-				Name:    "tailserverstatus",
-				Aliases: sliceOf("tss"),
+				Name:    "serverstatusloop",
+				Aliases: sliceOf("ssl"),
 				Usage:   "measure via serverStatus (continually)",
 				Flags: []cli.Flag{
 					&durationFlag,
@@ -104,7 +121,7 @@ func main() {
 						return err
 					}
 
-					return _runTailServerStatus(ctx, uri, c.Duration(durationFlag.Name))
+					return _runServerStatusLoop(ctx, uri, c.Duration(durationFlag.Name))
 				},
 			},
 		},
@@ -116,7 +133,7 @@ func main() {
 	}
 }
 
-func _runTailServerStatus(ctx context.Context, connstr string, window time.Duration) error {
+func _runServerStatusLoop(ctx context.Context, connstr string, window time.Duration) error {
 	interval := window / 10
 
 	client, err := getClient(connstr)
@@ -267,14 +284,135 @@ func _runTailServerStatus(ctx context.Context, connstr string, window time.Durat
 	}
 }
 
-var eventsToTruncate = sliceOf(
-	"insert",
-	"update",
-	"replace",
-	"delete",
-)
+func _runTailOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
+	client, err := getClient(connstr)
+	if err != nil {
+		return err
+	}
 
-var oplogOps = sliceOf("i", "u", "d")
+	isSharded, err := isSharded(ctx, client)
+	if err != nil {
+		return fmt.Errorf("determining whether cluster is sharded: %w", err)
+	}
+
+	if isSharded {
+		return fmt.Errorf("cannot tail oplog on a sharded cluster")
+	}
+
+	db := client.Database("local")
+
+	resp := db.RunCommand(
+		ctx,
+		bson.D{
+			{"find", "oplog.rs"},
+			{"filter", oplogQuery},
+			{"tailable", true},
+			{"awaitData", true},
+			{"projection", bson.D{
+				{"ts", 1},
+
+				{"op", makeOpFieldExpr("$$ROOT")},
+
+				{"size", agg.Cond{
+					If:   agg.Eq("$op", "c"),
+					Then: "$$REMOVE",
+					Else: agg.BSONSize("$$ROOT"),
+				}},
+
+				{"ops", agg.Cond{
+					If: agg.Eq("$op", "c"),
+					Then: agg.Map{
+						Input: "$o.applyOps",
+						As:    "opEntry",
+						In: bson.D{
+							{"op", agg.Concat(
+								"applyOps.",
+								makeOpFieldExpr("$$opEntry"),
+							)},
+							{"size", agg.BSONSize("$$opEntry")},
+						},
+					},
+				}},
+			}},
+		},
+	)
+
+	cursor, err := cursor.New(db, resp)
+
+	if err != nil {
+		return fmt.Errorf("opening oplog cursor: %w", err)
+	}
+
+	eventsMutex := sync.Mutex{}
+	eventSizesByType := map[string]int{}
+	eventCountsByType := map[string]int{}
+	var lag time.Duration
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+
+		start := time.Now()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				eventsMutex.Lock()
+				counts := maps.Clone(eventCountsByType)
+				sizes := maps.Clone(eventSizesByType)
+				eventsMutex.Unlock()
+
+				displayTable(counts, sizes, time.Since(start))
+
+				fmt.Printf("Lag: %s\n\n", lag)
+			}
+		}
+	}()
+
+	for !cursor.IsFinished() {
+		batch := cursor.GetCurrentBatch()
+
+		eventsMutex.Lock()
+
+		for i, op := range batch {
+			opType := mustExtract[string](op, "op")
+
+			switch opType {
+			case "c":
+				ops := mustExtract[[]bson.Raw](op, "ops")
+
+				for _, subOp := range ops {
+					opType := mustExtract[string](subOp, "op")
+					eventCountsByType[opType]++
+					eventSizesByType[opType] += mustExtract[int](subOp, "size")
+				}
+			default:
+				eventCountsByType[opType]++
+				eventSizesByType[opType] += mustExtract[int](op, "size")
+			}
+
+			if i == len(batch)-1 {
+				ts := mustExtract[bson.Timestamp](op, "ts")
+
+				ct := mustExtract[bson.Timestamp](
+					cursor.GetExtra()["$clusterTime"].Document(),
+					"clusterTime",
+				)
+
+				lag = time.Second * time.Duration(int(ct.T)-int(ts.T))
+			}
+		}
+
+		eventsMutex.Unlock()
+
+		if err := cursor.GetNext(ctx); err != nil {
+			return fmt.Errorf("reading oplog: %w", err)
+		}
+	}
+
+	panic("cursor should never finish!")
+}
 
 func _runOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
 	client, err := getClient(connstr)
@@ -334,125 +472,35 @@ func printOplogStats(ctx context.Context, client *mongo.Client, interval time.Du
 		// timestamp rather than just ts.t.
 		unixTimeStart := uint32(time.Now().Add(-interval).Unix())
 
-		return mongo.Pipeline{
-			// Match timestamp
-			{{"$match", bson.D{
-				{"ts", bson.D{{"$gte", bson.Timestamp{T: unixTimeStart}}}},
-			}}},
-
-			// Match op in ["i", "u", "d"] or applyOps array
-			{{"$match", bson.D{
-				{"$or", bson.A{
-					bson.D{
-						{"op", bson.D{{"$in", oplogOps}}},
-					},
-					bson.D{
-						{"op", "c"},
-						{"ns", "admin.$cmd"},
-						{"o.applyOps", bson.D{{"$type", "array"}}},
-					},
-				}},
-			}}},
-
-			// Normalize to ops array
-			{{"$addFields", bson.D{
-				{"ops", bson.D{
-					{"$cond", bson.D{
-						{"if", bson.D{{"$eq", bson.A{"$op", "c"}}}},
-						//{"then", "$o.applyOps"},
-						{"then", bson.D{
-							{"$map", bson.D{
-								{"input", "$o.applyOps"},
-								{"as", "opEntry"},
-								{"in", bson.D{
-									{"$mergeObjects", bson.A{
-										"$$opEntry",
-										bson.D{
-											{"op", bson.D{
-												{"$concat", bson.A{
-													"applyOps.",
-													"$$opEntry.op",
-												}},
-											}},
-										},
-									}},
-								}},
-							}},
-						}},
-						{"else", bson.A{"$$ROOT"}},
-					}},
-				}},
-			}}},
-
-			// Unwind ops
-			{{"$unwind", "$ops"}},
-
-			// Match sub-ops of interest
-			{{"$match", bson.D{
-				{"ops.op", bson.D{{"$in", lo.Flatten(
-					sliceOf(
-						oplogOps,
-						lo.Map(
-							oplogOps,
-							func(op string, _ int) string { return "applyOps." + op },
-						),
-					),
-				),
+		return lo.Flatten([]mongo.Pipeline{
+			{
+				// Match timestamp
+				{{"$match", bson.D{
+					{"ts", bson.D{{"$gte", bson.Timestamp{T: unixTimeStart}}}},
 				}}},
-			}}},
+			},
+			oplogUnrollFormatStages,
+			{
+				// Group by op type
+				{{"$group", bson.D{
+					{"_id", "$ops.op"},
+					{"count", bson.D{{"$sum", 1}}},
+					{"totalSize", bson.D{{"$sum", "$size"}}},
+					{"minTs", bson.D{{"$min", "$ts"}}},
+					{"maxTs", bson.D{{"$max", "$ts"}}},
+				}}},
 
-			// Add BSON size per op, and append either /u or /r to op:u.
-			{{"$addFields", bson.D{
-				{"size", bson.D{{"$bsonSize", "$ops"}}},
-
-				{"ops.op", bson.D{
-					{"$cond", bson.D{
-						{"if", bson.D{{"$in", bson.A{
-							"$ops.op",
-							bson.A{"u", "applyOps.u"},
-						}}}},
-						{"then", bson.D{
-							{"$concat", bson.A{
-								"$ops.op",
-								"/",
-								bson.D{
-									{"$cond", bson.D{
-										{"if", bson.D{
-											{"$eq", bson.A{
-												bson.D{{"$type", "$o._id"}},
-												"missing",
-											}},
-										}},
-										{"then", "r"},
-										{"else", "u"},
-									}},
-								},
-							}},
-						}},
-						{"else", "$ops.op"},
-					}},
-				}},
-			}}},
-
-			// Group by op type
-			{{"$group", bson.D{
-				{"_id", "$ops.op"},
-				{"count", bson.D{{"$sum", 1}}},
-				{"totalSize", bson.D{{"$sum", "$size"}}},
-				{"minTs", bson.D{{"$min", "$ts"}}},
-				{"maxTs", bson.D{{"$max", "$ts"}}},
-			}}},
-
-			// Final projection
-			{{"$project", bson.D{
-				{"op", "$_id"},
-				{"count", 1},
-				{"totalSize", 1},
-				{"minTs", 1},
-				{"maxTs", 1},
-				{"_id", 0},
-			}}},
-		}
+				// Final projection
+				{{"$project", bson.D{
+					{"op", "$_id"},
+					{"count", 1},
+					{"totalSize", 1},
+					{"minTs", 1},
+					{"maxTs", 1},
+					{"_id", 0},
+				}}},
+			},
+		})
 	}
 
 	cursor, err := coll.Aggregate(ctx, createPipeline())
@@ -722,7 +770,7 @@ func sliceOf[T any](els ...T) []T {
 	return slices.Clone(els)
 }
 
-func _runTailChangeStream(ctx context.Context, connstr string, interval time.Duration) error {
+func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Duration) error {
 	client, err := getClient(connstr)
 	if err != nil {
 		return err

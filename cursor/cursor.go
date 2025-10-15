@@ -23,6 +23,7 @@ type Cursor struct {
 	ns          string
 	db          *mongo.Database
 	curBatch    []bson.Raw
+	baseExtra   ExtraMap
 	cursorExtra ExtraMap
 }
 
@@ -32,6 +33,11 @@ type ExtraMap = map[string]bson.RawValue
 // GetCurrentBatch returns the Cursor’s current batch of documents.
 func (c Cursor) GetCurrentBatch() []bson.Raw {
 	return slices.Clone(c.curBatch)
+}
+
+// GetExtra returns the current response’s “extra” metadata.
+func (c Cursor) GetExtra() ExtraMap {
+	return maps.Clone(c.baseExtra)
 }
 
 // GetCursorExtra returns the current cursor batch’s “extra” metadata.
@@ -84,6 +90,7 @@ func (c *Cursor) GetNext(ctx context.Context, extraPieces ...bson.E) error {
 	}
 
 	c.curBatch = baseResp.Cursor.NextBatch
+	c.baseExtra = baseResp.Extra
 	c.cursorExtra = baseResp.Cursor.Extra
 	c.id = baseResp.Cursor.ID
 
@@ -100,6 +107,7 @@ type cursorResponse struct {
 
 type baseResponse struct {
 	Cursor cursorResponse
+	Extra  ExtraMap `bson:",inline"`
 }
 
 // New creates a Cursor from the response of a cursor-returning command
@@ -130,6 +138,7 @@ func New(
 		id:          baseResp.Cursor.ID,
 		ns:          baseResp.Cursor.Ns,
 		curBatch:    baseResp.Cursor.FirstBatch,
+		baseExtra:   baseResp.Extra,
 		cursorExtra: baseResp.Cursor.Extra,
 	}, nil
 }
