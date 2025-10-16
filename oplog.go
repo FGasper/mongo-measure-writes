@@ -42,6 +42,10 @@ func makeOplogSingleOpFilterExpr(opRef string, opsToAccept []string) any {
 			agg.SubstrBytes{opRef + ".ns", 0, 7},
 			"config.",
 		)},
+		agg.Not{agg.Eq(
+			agg.SubstrBytes{opRef + ".ns", 0, 6},
+			"admin.",
+		)},
 	}
 }
 
@@ -80,8 +84,12 @@ var oplogUnrollFormatStages = mongo.Pipeline{
 		{"ops", agg.Cond{
 			If: agg.Eq("$op", "c"),
 			Then: agg.Map{
-				Input: "$o.applyOps",
-				As:    "opEntry",
+				Input: agg.Filter{
+					Input: "$o.applyOps",
+					As:    "opEntry",
+					Cond:  makeOplogSingleOpFilterExpr("$$opEntry", oplogOps),
+				},
+				As: "opEntry",
 				In: agg.MergeObjects{
 					"$$opEntry",
 					bson.D{
@@ -148,6 +156,10 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 			{"tailable", true},
 			{"awaitData", true},
 			{"projection", bson.D{
+				// for debugging:
+				//{"ns", 1},
+				//{"o", 1},
+
 				{"ts", 1},
 
 				{"op", makeSuffixedOpFieldExpr("$$ROOT")},
@@ -229,7 +241,11 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 				ops := mustExtract[[]bson.Raw](op, "ops")
 
 				for _, subOp := range ops {
-					opType := "applyOps." + mustExtract[string](subOp, "op")
+					subOpType := mustExtract[string](subOp, "op")
+					if subOpType == "d" {
+						fmt.Printf("---- has applyOps.d: %+v\n\n", op)
+					}
+					opType := "applyOps." + subOpType
 					eventCountsByType[opType]++
 					eventSizesByType[opType] += mustExtract[int](subOp, "size")
 				}

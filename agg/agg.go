@@ -129,3 +129,26 @@ func (m Map) D() bson.D {
 func (m Map) MarshalBSON() ([]byte, error) {
 	return bson.Marshal(m.D())
 }
+
+// ------------------------------------------
+
+type Filter struct {
+	Input, As, Cond, Limit any
+}
+
+var _ bson.Marshaler = Filter{}
+
+func (f Filter) D() bson.D {
+	return bson.D{
+		{"$filter", bson.D{
+			{"input", f.Input},
+			{"as", f.As},
+			{"cond", f.Cond},
+			{"limit", f.Limit},
+		}},
+	}
+}
+
+func (f Filter) MarshalBSON() ([]byte, error) {
+	return bson.Marshal(f.D())
+}
