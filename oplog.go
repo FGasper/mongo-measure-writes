@@ -242,9 +242,6 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 
 				for _, subOp := range ops {
 					subOpType := mustExtract[string](subOp, "op")
-					if subOpType == "d" {
-						fmt.Printf("---- has applyOps.d: %+v\n\n", op)
-					}
 					opType := "applyOps." + subOpType
 					eventCountsByType[opType]++
 					eventSizesByType[opType] += mustExtract[int](subOp, "size")

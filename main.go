@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/FGasper/mongo-measure-writes/mmongo"
 	"github.com/urfave/cli/v3"
 )
 
@@ -14,6 +15,15 @@ func main() {
 		uri := c.Args().First()
 		if uri == "" {
 			return "", fmt.Errorf("connection string required")
+		}
+
+		altered, uri, err := mmongo.MaybeAddDirectConnection(uri)
+		if err != nil {
+			return "", fmt.Errorf("parsing connection string: %w", err)
+		}
+
+		if altered {
+			fmt.Fprint(os.Stderr, "NOTE: Defaulting to direct connection.\n")
 		}
 
 		return uri, nil
