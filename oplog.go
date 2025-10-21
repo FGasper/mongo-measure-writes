@@ -4,13 +4,13 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"maps"
 	"slices"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FGasper/mongo-measure-writes/agg"
 	"github.com/FGasper/mongo-measure-writes/cursor"
+	"github.com/FGasper/mongo-measure-writes/history"
 	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -119,7 +119,20 @@ var oplogUnrollFormatStages = mongo.Pipeline{
 	}}},
 }
 
-func _runTailOplogMode(ctx context.Context, connstr string, interval time.Duration) error {
+type eventStats struct {
+	sizes, counts map[string]int
+}
+
+func _runTailOplogMode(
+	ctx context.Context,
+	connstr string,
+	window time.Duration,
+	reportInterval time.Duration,
+) error {
+	if reportInterval > window {
+		return fmt.Errorf("report interval must not exceed window")
+	}
+
 	client, err := getClient(connstr)
 	if err != nil {
 		return err
@@ -192,38 +205,55 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 		return fmt.Errorf("opening oplog cursor: %w", err)
 	}
 
-	fmt.Printf("Listening for oplog events. Stats showing every %s …\n", interval)
+	fmt.Printf("Listening for oplog events. Stats showing every %s …\n", reportInterval)
 
-	eventsMutex := sync.Mutex{}
-	eventSizesByType := map[string]int{}
-	eventCountsByType := map[string]int{}
-	var lag time.Duration
+	eventsHistory := history.New[eventStats](window)
+
+	var lag atomic.Pointer[time.Duration]
 
 	go func() {
-		ticker := time.NewTicker(interval)
-
-		start := time.Now()
+		ticker := time.NewTicker(reportInterval)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				eventsMutex.Lock()
+				eventsInWindow := eventsHistory.Get()
 
-				counts := maps.Clone(eventCountsByType)
-				sizes := maps.Clone(eventSizesByType)
+				totalStats := eventStats{}
+				initMap(&totalStats.counts)
+				initMap(&totalStats.sizes)
 
-				evacuateMap(eventCountsByType)
-				evacuateMap(eventSizesByType)
+				for _, curLog := range eventsInWindow {
+					for evtType, val := range curLog.Datum.counts {
+						if _, ok := totalStats.counts[evtType]; !ok {
+							totalStats.counts[evtType] = val
+						} else {
+							totalStats.counts[evtType] += val
+						}
+					}
 
-				eventsMutex.Unlock()
+					for evtType, val := range curLog.Datum.sizes {
+						if _, ok := totalStats.sizes[evtType]; !ok {
+							totalStats.sizes[evtType] = val
+						} else {
+							totalStats.sizes[evtType] += val
+						}
 
-				displayTable(counts, sizes, time.Since(start))
+					}
+				}
 
-				start = time.Now()
+				curStatsInterval := time.Since(eventsInWindow[0].At)
 
-				fmt.Printf("Lag: %s\n\n", lag)
+				displayTable(totalStats.counts, totalStats.sizes, curStatsInterval)
+				fmt.Printf(
+					"Got %s event batches over %s (%s/sec)\n",
+					FmtReal(len(eventsInWindow)),
+					curStatsInterval.Round(10*time.Millisecond),
+					FmtReal(float64(len(eventsInWindow))/curStatsInterval.Seconds()),
+				)
+				fmt.Printf("Lag: %s\n\n", lo.FromPtr(lag.Load()))
 			}
 		}
 	}()
@@ -231,7 +261,9 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 	for !cursor.IsFinished() {
 		batch := cursor.GetCurrentBatch()
 
-		eventsMutex.Lock()
+		curEventStats := eventStats{}
+		initMap(&curEventStats.counts)
+		initMap(&curEventStats.sizes)
 
 		for i, op := range batch {
 			opType := mustExtract[string](op, "op")
@@ -243,15 +275,15 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 				for _, subOp := range ops {
 					subOpType := mustExtract[string](subOp, "op")
 					opType := "applyOps." + subOpType
-					eventCountsByType[opType]++
-					eventSizesByType[opType] += mustExtract[int](subOp, "size")
+					curEventStats.counts[opType]++
+					curEventStats.sizes[opType] += mustExtract[int](subOp, "size")
 				}
 			case "n":
 				// There is nothing to count; this is just here so that
 				// reported lag doesn’t balloon in the event of quiesced writes.
 			default:
-				eventCountsByType[opType]++
-				eventSizesByType[opType] += mustExtract[int](op, "size")
+				curEventStats.counts[opType]++
+				curEventStats.sizes[opType] += mustExtract[int](op, "size")
 			}
 
 			if i == len(batch)-1 {
@@ -262,11 +294,11 @@ func _runTailOplogMode(ctx context.Context, connstr string, interval time.Durati
 					"clusterTime",
 				)
 
-				lag = time.Second * time.Duration(int(ct.T)-int(ts.T))
+				lag.Store(lo.ToPtr(time.Second * time.Duration(int(ct.T)-int(ts.T))))
 			}
 		}
 
-		eventsMutex.Unlock()
+		eventsHistory.Add(curEventStats)
 
 		if err := cursor.GetNext(ctx); err != nil {
 			return fmt.Errorf("reading oplog: %w", err)

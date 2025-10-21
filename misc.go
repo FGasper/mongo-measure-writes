@@ -19,6 +19,10 @@ func getClient(connstr string) (*mongo.Client, error) {
 	return client, nil
 }
 
+func initMap[K comparable, V any, M ~map[K]V](theMapRef *M) {
+	*theMapRef = make(M)
+}
+
 func evacuateMap[K comparable, V any, M ~map[K]V](theMap M) {
 	for k := range theMap {
 		delete(theMap, k)

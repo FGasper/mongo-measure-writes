@@ -30,10 +30,17 @@ func main() {
 	}
 
 	durationFlag := cli.DurationFlag{
-		Name:    "duration",
+		Name:    "delay",
 		Aliases: sliceOf("d"),
-		Usage:   "interval over which to compile metrics",
-		Value:   time.Minute,
+		Usage:   "delay between reports",
+		Value:   30 * time.Second,
+	}
+
+	windowFlag := cli.DurationFlag{
+		Name:    "window",
+		Aliases: sliceOf("w"),
+		Usage:   "window over which to compile metrics",
+		Value:   5 * time.Minute,
 	}
 
 	cmd := cli.Command{
@@ -45,7 +52,7 @@ func main() {
 				Aliases: sliceOf("ao"),
 				Usage:   "measure by reading the oplog once",
 				Flags: []cli.Flag{
-					&durationFlag,
+					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -53,7 +60,7 @@ func main() {
 						return err
 					}
 
-					return _runOplogMode(ctx, uri, c.Duration(durationFlag.Name))
+					return _runOplogMode(ctx, uri, c.Duration(windowFlag.Name))
 				},
 			},
 			{
@@ -62,6 +69,7 @@ func main() {
 				Usage:   "measure by tailing the oplog",
 				Flags: []cli.Flag{
 					&durationFlag,
+					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -69,7 +77,7 @@ func main() {
 						return err
 					}
 
-					return _runTailOplogMode(ctx, uri, c.Duration(durationFlag.Name))
+					return _runTailOplogMode(ctx, uri, c.Duration(windowFlag.Name), c.Duration(durationFlag.Name))
 				},
 			},
 			{
@@ -77,7 +85,7 @@ func main() {
 				Aliases: sliceOf("cs"),
 				Usage:   "measure by reading a change stream (once)",
 				Flags: []cli.Flag{
-					&durationFlag,
+					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -85,7 +93,7 @@ func main() {
 						return err
 					}
 
-					return _runChangeStream(ctx, uri, c.Duration(durationFlag.Name))
+					return _runChangeStream(ctx, uri, c.Duration(windowFlag.Name))
 				},
 			},
 			{
@@ -93,7 +101,7 @@ func main() {
 				Aliases: sliceOf("tcs"),
 				Usage:   "measure by tailing a change stream",
 				Flags: []cli.Flag{
-					&durationFlag,
+					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -101,7 +109,7 @@ func main() {
 						return err
 					}
 
-					return _runChangeStreamLoop(ctx, uri, c.Duration(durationFlag.Name))
+					return _runChangeStreamLoop(ctx, uri, c.Duration(windowFlag.Name))
 				},
 			},
 			{
@@ -109,7 +117,7 @@ func main() {
 				Aliases: sliceOf("ssl"),
 				Usage:   "measure via serverStatus (continually)",
 				Flags: []cli.Flag{
-					&durationFlag,
+					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					uri, err := getURI(c)
@@ -117,7 +125,7 @@ func main() {
 						return err
 					}
 
-					return _runServerStatusLoop(ctx, uri, c.Duration(durationFlag.Name))
+					return _runServerStatusLoop(ctx, uri, c.Duration(windowFlag.Name))
 				},
 			},
 		},
