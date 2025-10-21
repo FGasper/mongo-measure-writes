@@ -2,9 +2,9 @@ package mmongo
 
 import (
 	"fmt"
+	"strings"
 
-	"github.com/samber/lo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 )
 
 // MaybeAddDirectConnection adds the `directConnection` parameter
@@ -16,22 +16,32 @@ import (
 // This logic mimics mongosh’s behavior. See:
 // https://github.com/mongodb-js/mongosh/blob/fea739edfa86edc2a60756d9a9d478f87d94ddda/packages/arg-parser/src/uri-generator.ts#L308
 func MaybeAddDirectConnection(in string) (bool, string, error) {
-	opts := options.Client().ApplyURI(in)
-	if err := opts.Validate(); err != nil {
+	cs, err := connstring.ParseAndValidate(in)
+
+	if err != nil {
 		return false, "", fmt.Errorf("parsing connection string %#q: %w", in, err)
 	}
 
 	var added bool
 
-	switch len(opts.Hosts) {
+	switch len(cs.Hosts) {
 	case 0:
 		return false, "", fmt.Errorf("connection string has no hosts?? (%#q)", in)
 	case 1:
-		if opts.ReplicaSet == nil && opts.Direct == nil && opts.LoadBalanced == nil {
-			opts.Direct = lo.ToPtr(true)
+		if cs.ReplicaSet == "" && !cs.DirectConnectionSet && !cs.LoadBalancedSet {
+			if !strings.Contains(in, "?") {
+				if cs.Database == "" {
+					in += "/"
+				}
+
+				in += "?"
+			}
+
+			in += "directConnection=true"
+
 			added = true
 		}
 	}
 
-	return added, opts.GetURI(), nil
+	return added, in, nil
 }
