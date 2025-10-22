@@ -22,15 +22,17 @@ func displayTable(
 	}
 
 	if len(eventCountsByType) == 0 {
-		fmt.Printf("No writes seen.\n")
+		fmt.Printf("No writes seen over %s.\n", delta.Round(10*time.Millisecond))
 		return
 	}
 
 	allEventsCount := lo.Sum(slices.Collect(maps.Values(eventCountsByType)))
 	totalSize := lo.Sum(slices.Collect(maps.Values(eventSizesByType)))
 
+	fmt.Print("\n")
+
 	fmt.Printf(
-		"\n%s ops/sec (%s/sec; avg: %s)\n",
+		"%s ops/sec (%s/sec; avg: %s)\n",
 		FmtReal((mmmath.DivideToF64(allEventsCount, delta.Seconds()))),
 		FmtBytes(mmmath.DivideToF64(totalSize, delta.Seconds())),
 		FmtBytes(mmmath.DivideToF64(totalSize, allEventsCount)),
@@ -53,13 +55,11 @@ func displayTable(
 		lo.Must0(table.Append([]string{
 			eventType,
 			fmt.Sprintf(
-				"%s (%s%%)",
-				FmtReal(eventCountsByType[eventType]),
+				"%s%%",
 				FmtReal(100*countFraction),
 			),
 			fmt.Sprintf(
-				"%s (%s%%)",
-				FmtBytes(eventSizesByType[eventType]),
+				"%s%%",
 				FmtReal(100*sizeFraction),
 			),
 			FmtBytes(mmmath.DivideToF64(eventSizesByType[eventType], eventCountsByType[eventType])),

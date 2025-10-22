@@ -119,43 +119,6 @@ var oplogUnrollFormatStages = mongo.Pipeline{
 	}}},
 }
 
-type eventStats struct {
-	sizes, counts map[string]int
-}
-
-func tallyEventsHistory(
-	eventsHistory *history.History[eventStats],
-) (eventStats, int, time.Duration) {
-	eventsInWindow := eventsHistory.Get()
-
-	totalStats := eventStats{}
-	initMap(&totalStats.counts)
-	initMap(&totalStats.sizes)
-
-	for _, curLog := range eventsInWindow {
-		for evtType, val := range curLog.Datum.counts {
-			if _, ok := totalStats.counts[evtType]; !ok {
-				totalStats.counts[evtType] = val
-			} else {
-				totalStats.counts[evtType] += val
-			}
-		}
-
-		for evtType, val := range curLog.Datum.sizes {
-			if _, ok := totalStats.sizes[evtType]; !ok {
-				totalStats.sizes[evtType] = val
-			} else {
-				totalStats.sizes[evtType] += val
-			}
-
-		}
-	}
-
-	curStatsInterval := time.Since(eventsInWindow[0].At)
-
-	return totalStats, len(eventsInWindow), curStatsInterval
-}
-
 func _runTailOplogMode(
 	ctx context.Context,
 	connstr string,
@@ -238,7 +201,7 @@ func _runTailOplogMode(
 		return fmt.Errorf("opening oplog cursor: %w", err)
 	}
 
-	fmt.Printf("Listening for oplog events. Stats showing every %s …\n", reportInterval)
+	fmt.Printf("Listening for oplog events. Stats showing every %s …\n\n", reportInterval)
 
 	eventsHistory := history.New[eventStats](window)
 
@@ -252,15 +215,9 @@ func _runTailOplogMode(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				totalStats, batchesCount, curStatsInterval := tallyEventsHistory(eventsHistory)
+				totalStats, _, curStatsInterval := tallyEventsHistory(eventsHistory)
 
 				displayTable(totalStats.counts, totalStats.sizes, curStatsInterval)
-				fmt.Printf(
-					"Got %s event batches over %s (%s/sec)\n",
-					FmtReal(batchesCount),
-					curStatsInterval.Round(10*time.Millisecond),
-					FmtReal(float64(batchesCount)/curStatsInterval.Seconds()),
-				)
 				fmt.Printf("Lag: %s\n\n", lo.FromPtr(lag.Load()))
 			}
 		}

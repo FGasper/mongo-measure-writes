@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/olekukonko/errors"
+	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
