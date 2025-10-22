@@ -101,6 +101,7 @@ func main() {
 				Aliases: sliceOf("tcs"),
 				Usage:   "measure by tailing a change stream",
 				Flags: []cli.Flag{
+					&durationFlag,
 					&windowFlag,
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
@@ -109,7 +110,7 @@ func main() {
 						return err
 					}
 
-					return _runChangeStreamLoop(ctx, uri, c.Duration(windowFlag.Name))
+					return _runChangeStreamLoop(ctx, uri, c.Duration(windowFlag.Name), c.Duration(durationFlag.Name))
 				},
 			},
 			{

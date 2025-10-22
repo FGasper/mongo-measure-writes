@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FGasper/mongo-measure-writes/agg"
 	"github.com/FGasper/mongo-measure-writes/cursor"
+	"github.com/FGasper/mongo-measure-writes/history"
 	"github.com/FGasper/mongo-measure-writes/resumetoken"
+	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -147,7 +149,11 @@ cursorLoop:
 	return nil
 }
 
-func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Duration) error {
+func _runChangeStreamLoop(
+	ctx context.Context,
+	connstr string,
+	window, reportInterval time.Duration,
+) error {
 	client, err := getClient(connstr)
 	if err != nil {
 		return err
@@ -163,20 +169,15 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 	cs, err := client.Watch(
 		sctx,
 		mongo.Pipeline{
-			{{"$addFields", bson.D{
-				{"operationType", "$$REMOVE"},
+			{{"$project", bson.D{
+				{"_id", 1},
+				{"clusterTime", 1},
 				{"op", agg.Cond{
 					If:   agg.In("$operationType", eventsToTruncate...),
 					Then: agg.SubstrBytes{"$operationType", 0, 1},
 					Else: "$operationType",
 				}},
 				{"size", agg.BSONSize("$$ROOT")},
-			}}},
-			{{"$project", bson.D{
-				{"_id", 1},
-				{"op", 1},
-				{"size", 1},
-				{"clusterTime", 1},
 			}}},
 		},
 		options.ChangeStream().
@@ -190,34 +191,21 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 	}
 	defer cs.Close(sctx)
 
-	fmt.Printf("Listening for change events. Stats showing every %s …\n", interval)
+	fmt.Printf("Listening for change events. Stats showing every %s …\n", reportInterval)
 
-	eventSizesByType := map[string]int{}
-	eventCountsByType := map[string]int{}
-	eventCountsMutex := sync.Mutex{}
-	var changeStreamLag uint32
+	eventsHistory := history.New[eventStats](window)
+
+	var changeStreamLag atomic.Pointer[time.Duration]
 
 	go func() {
-		startTime := time.Now()
-
 		for {
-			time.Sleep(interval)
+			time.Sleep(reportInterval)
 
-			eventCountsMutex.Lock()
+			totalStats, _, curStatsInterval := tallyEventsHistory(eventsHistory)
 
-			now := time.Now()
-			delta := now.Sub(startTime)
+			displayTable(totalStats.counts, totalStats.sizes, curStatsInterval)
 
-			displayTable(eventCountsByType, eventSizesByType, delta)
-
-			fmt.Printf("Change stream lag: %s\n", time.Duration(changeStreamLag)*time.Second)
-
-			evacuateMap(eventCountsByType)
-			evacuateMap(eventSizesByType)
-
-			startTime = time.Now()
-
-			eventCountsMutex.Unlock()
+			fmt.Printf("Change stream lag: %s\n", lo.FromPtr(changeStreamLag.Load()))
 		}
 	}()
 
@@ -226,6 +214,10 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 		fullEventName[eventName[:1]] = eventName
 	}
 
+	var curEventStats eventStats
+	initMap(&curEventStats.counts)
+	initMap(&curEventStats.sizes)
+
 	for cs.Next(sctx) {
 		op := cs.Current.Lookup("op").StringValue()
 
@@ -233,9 +225,14 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 			op = fullOp
 		}
 
-		eventCountsMutex.Lock()
-		eventCountsByType[op]++
-		eventSizesByType[op] += int(cs.Current.Lookup("size").AsInt64())
+		curEventStats.counts[op]++
+		curEventStats.sizes[op] += int(cs.Current.Lookup("size").AsInt64())
+
+		if cs.RemainingBatchLength() == 0 {
+			eventsHistory.Add(curEventStats)
+			initMap(&curEventStats.counts)
+			initMap(&curEventStats.sizes)
+		}
 
 		sessTS, err := GetClusterTimeFromSession(sess)
 		if err != nil {
@@ -243,10 +240,9 @@ func _runChangeStreamLoop(ctx context.Context, connstr string, interval time.Dur
 		} else {
 			eventT, _ := cs.Current.Lookup("clusterTime").Timestamp()
 
-			changeStreamLag = sessTS.T - eventT
+			lagSecs := int64(sessTS.T) - int64(eventT)
+			changeStreamLag.Store(lo.ToPtr(time.Duration(lagSecs) * time.Second))
 		}
-
-		eventCountsMutex.Unlock()
 	}
 	if cs.Err() != nil {
 		return fmt.Errorf("reading change stream: %w", cs.Err())
