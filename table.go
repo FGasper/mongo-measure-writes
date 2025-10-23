@@ -67,4 +67,6 @@ func displayTable(
 	}
 
 	lo.Must0(table.Render())
+
+	fmt.Printf("Sample window: %s\n", delta.Round(10*time.Millisecond))
 }
