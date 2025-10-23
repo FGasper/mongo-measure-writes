@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math"
 
-	mmmath "github.com/FGasper/mongo-measure-writes/math"
+	mmmath "github.com/FGasper/mongo-speedcam/math"
 	"github.com/dustin/go-humanize"
 	"golang.org/x/exp/constraints"
 )

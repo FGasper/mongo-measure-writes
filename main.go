@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/FGasper/mongo-measure-writes/mmongo"
+	"github.com/FGasper/mongo-speedcam/mmongo"
 	"github.com/urfave/cli/v3"
 )
 

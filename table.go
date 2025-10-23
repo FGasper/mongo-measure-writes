@@ -7,7 +7,7 @@ import (
 	"slices"
 	"time"
 
-	mmmath "github.com/FGasper/mongo-measure-writes/math"
+	mmmath "github.com/FGasper/mongo-speedcam/math"
 	"github.com/olekukonko/tablewriter"
 	"github.com/samber/lo"
 )

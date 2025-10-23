@@ -3,7 +3,7 @@ package main
 import (
 	"time"
 
-	"github.com/FGasper/mongo-measure-writes/history"
+	"github.com/FGasper/mongo-speedcam/history"
 )
 
 type eventStats struct {

@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/FGasper/mongo-measure-writes/agg"
-	"github.com/FGasper/mongo-measure-writes/cursor"
-	"github.com/FGasper/mongo-measure-writes/history"
+	"github.com/FGasper/mongo-speedcam/agg"
+	"github.com/FGasper/mongo-speedcam/cursor"
+	"github.com/FGasper/mongo-speedcam/history"
 	"github.com/samber/lo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"

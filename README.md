@@ -1,4 +1,4 @@
-# mongo-measure-writes
+# mongo-speedcam
 
 This tool reports various statistics around a MongoDB cluster’s write load.
 
@@ -6,13 +6,13 @@ This tool reports various statistics around a MongoDB cluster’s write load.
 ```
 go build
 ```
-Then type `./mongo-measure-writes --help`.
+Then type `./mongo-speedcam --help`.
 
 ## Oplog Mode
 
 In its simplest form, this tool queries the oplog then prints a report, thus:
 ```
-> ./mongo-measure-writes aggregate-oplog 'mongodb://localhost:27017'
+> ./mongo-speedcam aggregate-oplog 'mongodb://localhost:27017'
 
 Querying the oplog for write stats over the last 1m0s …
 

@@ -1,4 +1,4 @@
-module github.com/FGasper/mongo-measure-writes
+module github.com/FGasper/mongo-speedcam
 
 go 1.24.4
 
